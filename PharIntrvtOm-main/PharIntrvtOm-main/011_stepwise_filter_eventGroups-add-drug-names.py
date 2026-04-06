@@ -1,89 +1,91 @@
-''' only drug treatment trila should be included (not medicial drug trials) and
-and make it easier searchable in pubchem , (beautify the names)
+# -*- coding: utf-8 -*-
+"""
+DDI Tox-Predict Project
+Script 011: Stepwise Filter EventGroups & Add Drug Names (Powered by NEW google-genai)
 
--next gpt prompt
-- identify whihc is a small molecule ()
+This script uses Gemini to extract drug names from clinical trial event groups,
+expand abbreviations, and handle combination therapies.
+"""
 
-
-To do:
-    extract traial swere ther is insufficient information in eventgroups
-'''
-import openai
 import json
-import re
 import os
+import time
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
-load_dotenv()
+def main():
+    # 1. Load API Key from .env
+    load_dotenv()
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not found in .env file.")
 
-# Set your OpenAI API key
-openai.api_key = os.getenv('OPENAI_API_KEY')
+    # 2. Initialize Gemini Client
+    client = genai.Client(api_key=api_key)
+    model_id = 'gemini-2.5-flash'
 
-# Load the JSON data
-with open('special-trials.json', 'r') as file:
-    data = json.load(file)
-
-# Define the prompt for GPT
-
-#add the descitption part t teh input and include placebo and the control groups
-prompt_template = '''For each eventGroup in resultsSection.adverseEventsModule of the input JSON, extract only drug names from title or description, add a drugs key with these names as an array, and expand any abbreviations. Please also list every drug in a combination drug separately. For Placebo and Control groups without further specification write placebo or control accordingly in the drugs key. Return the updated JSON. And here is the input json:
-'''
-
-
-# Initialize an empty list to store the filtered results
-filtered_trials = []
-total_tokens_used = 0
-
-
-# Process in batches
-n = 5 # Batches
-
-
-# Process in batches
-for i in range(0, len(data), n):  
-    batch = data[i:i+n]
-    trials_json_str = json.dumps(batch, indent=4)
-    full_prompt = prompt_template + "\n" + trials_json_str
-
+    # Load input data from Script 013
+    input_file = 'special-trials.json'
+    print(f"Loading data from {input_file}...")
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4o-2024-08-06",
-            messages=[
-                {"role": "system", "content": "You are an expert in clinical trial data analysis and pharmacology."},
-                {"role": "user", "content": full_prompt}
-            ],
-            timeout=1200  # Set timeout for the API request
-        )
+        with open(input_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: {input_file} not found. Please run Script 013 first.")
+        return
 
-        response_text = response['choices'][0]['message']['content']
+    # Define the Prompt for drug extraction
+    prompt_template = """
+    For each eventGroup in resultsSection.adverseEventsModule of the input JSON, 
+    extract only drug names from the title or description. 
+    1. Add a 'drugs' key with these names as an array.
+    2. Expand abbreviations (e.g., 'TDF' to 'Tenofovir Disoproxil Fumarate').
+    3. List each component of a combination drug separately.
+    4. For Placebo/Control groups, write 'placebo' or 'control' in the array.
+    Return ONLY the updated JSON array.
+    """
 
-        # Correct the extraction by focusing on JSON portion accurately
+    filtered_trials = []
+    batch_size = 5 # Number of trials per API call
+    
+    print(f"Starting Gemini extraction for {len(data)} trials...")
+
+    for i in range(0, len(data), batch_size):
+        batch = data[i:i + batch_size]
+        batch_json_str = json.dumps(batch, indent=2)
+        
+        full_content = f"{prompt_template}\n\nInput JSON:\n{batch_json_str}"
+
         try:
-            json_data_start = response_text.index('[')
-            json_data_end = response_text.rindex(']') + 1
-            json_string = response_text[json_data_start:json_data_end]
-            batch_filtered_trials = json.loads(json_string)
-            filtered_trials.extend(batch_filtered_trials)
-        except ValueError as e:
-            print(f"JSON extraction error: {e}")
-        except json.JSONDecodeError as e:
-            print(f"Failed to decode JSON: {e}")
-            print("Response text that caused the error:\n", response_text)
+            # Call Gemini API
+            response = client.models.generate_content(
+                model=model_id,
+                contents=full_content,
+                config=types.GenerateContentConfig(
+                    system_instruction="You are an expert in pharmacology and clinical trial documentation.",
+                    temperature=0.1,
+                    response_mime_type="application/json" # Ensure JSON output
+                )
+            )
+            
+            # Parse the response text as JSON
+            batch_result = json.loads(response.text)
+            filtered_trials.extend(batch_result)
+            
+            # Save progress after each batch
+            with open('gpt_filteres-special-trials-w-or-final.json', 'w', encoding='utf-8') as f:
+                json.dump(filtered_trials, f, indent=4)
+            
+            print(f"Processed {min(i + batch_size, len(data))}/{len(data)} trials...")
+            
+            # Rate limit protection for Free Tier
+            time.sleep(2)
 
-        tokens_used = response.get('usage', {}).get('total_tokens', 0)
-        total_tokens_used += tokens_used
+        except Exception as e:
+            print(f"Error at batch starting index {i}: {e}")
 
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    print("✅ Successfully completed drug name extraction!")
 
-    # Save the filtered results after each batch by overwriting the same file
-    with open('gpt_filteres-special-trials-w-or-final.json', 'w') as file:
-        json.dump(filtered_trials, file, indent=4)
-
-    # Log progress
-    if i % 10 == 0:
-        print(f"Processed {i} trials")
-
-
-print("Filtered trials have been saved to JSON")
-print(f"Total tokens used: {total_tokens_used}")
+if __name__ == "__main__":
+    main()
