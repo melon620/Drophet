@@ -1,21 +1,23 @@
 # -*- coding: utf-8 -*-
+"""
+DDI Tox-Predict Project
+Script 003: Local Categorizer (SciSpacy Light Edition)
+Optimized for low-RAM environments (GitHub Codespaces)
+"""
+
 import json
 import os
-import time
-from google import genai
-from google.genai import types
-from dotenv import load_dotenv
+import spacy
+import scispacy
+from scispacy.linking import EntityLinker
+from collections import defaultdict
 
 def recursive_find_terms(obj):
-    """
-    唔理個 JSON 有幾深，只要見到 'term' 就擸。
-    如果搵唔到 'term'，就擸埋 'title' 同 'description' 做 Candidate。
-    """
     extracted = set()
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k in ['term', 'title'] and isinstance(v, str):
-                if len(v) > 2: # 避開太短嘅 ID
+                if len(v) > 2 and not v.startswith("NCT"): 
                     extracted.add(v.strip())
             else:
                 extracted.update(recursive_find_terms(v))
@@ -25,15 +27,6 @@ def recursive_find_terms(obj):
     return extracted
 
 def main():
-    load_dotenv()
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        print("❌ Error: GEMINI_API_KEY is missing!")
-        return
-
-    client = genai.Client(api_key=api_key)
-    model_id = 'gemini-2.0-flash' # 快、平、準
-
     input_file = 'special-trials.json'
     if not os.path.exists(input_file):
         print(f"❌ Error: {input_file} not found!")
@@ -43,62 +36,67 @@ def main():
     with open(input_file, 'r', encoding='utf-8') as f:
         trials = json.load(f)
 
-    # 1. 深度提取 (Deep Extraction)
-    print("🔎 Deep scanning for terms...")
-    all_potential_terms = recursive_find_terms(trials)
-    
-    # 移除一啲明顯唔係副作用嘅字 (例如 NCT ID)
-    event_list = sorted([t for t in all_potential_terms if not t.startswith("NCT")])
-    print(f"✅ Extracted {len(event_list)} potential terms.")
+    event_list = sorted(list(recursive_find_terms(trials)))
+    print(f"✅ Extracted {len(event_list)} raw clinical terms.")
 
-    if not event_list:
-        print("🚨 CRITICAL: Still 0 terms found. Check your JSON again.")
+    # 轉用 'sm' 模型以節省 RAM
+    print("🧠 Loading Light Medical NLP Model (en_core_sci_sm)...")
+    try:
+        nlp = spacy.load("en_core_sci_sm")
+    except OSError:
+        print("❌ Error: Model 'en_core_sci_sm' not found. Please install it first.")
         return
 
-    # 2. Gemini Categorization Logic
-    # 呢度個 Prompt 好重要：叫佢幫你分邊啲係 AE，邊啲係藥名(藥名要掉咗佢)
-    prompt = """
-    Analyze the following clinical terms. 
-    1. Identify which ones are Adverse Events (AEs).
-    2. Categorize them into MedDRA System Organ Classes (SOCs).
-    3. Discard any terms that are drug names, study titles, or descriptions.
-    Return ONLY a JSON dictionary: {"SOC Name": ["Term1", "Term2"]}
-    """
+    # 減少 Linker 載入嘅候選數量，進一步節省記憶體
+    print("🔗 Adding UMLS Entity Linker (Optimized)...")
+    nlp.add_pipe("scispacy_linker", config={
+        "resolve_abbreviations": True, 
+        "linker_name": "umls",
+        "max_entities_per_mention": 1 # 只攞最準嗰個，慳 RAM
+    })
+    
+    final_mapping = defaultdict(list)
 
-    batch_size = 50
-    final_mapping = {}
-
-    for i in range(0, len(event_list), batch_size):
-        batch = event_list[i:i+batch_size]
-        print(f"📦 Processing Batch {i//batch_size + 1}/{ (len(event_list)//batch_size)+1 }...")
+    print(f"🚀 Processing {len(event_list)} terms locally...")
+    
+    for i, term in enumerate(event_list):
+        doc = nlp(term)
         
-        try:
-            response = client.models.generate_content(
-                model=model_id,
-                contents=f"{prompt}\nTerms: {', '.join(batch)}",
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json"
-                )
-            )
+        if doc.ents:
+            main_ent = doc.ents[0]
+            category = "General Disorders"
             
-            if response.text:
-                batch_data = json.loads(response.text)
-                for soc, terms in batch_data.items():
-                    if soc not in final_mapping:
-                        final_mapping[soc] = []
-                    final_mapping[soc].extend(terms)
-            time.sleep(1)
-        except Exception as e:
-            print(f"   ⚠️ Batch Error: {e}")
+            t = term.lower()
+            # 關鍵字映射優先 (Keyword-first approach)
+            if any(x in t for x in ['liver', 'alt', 'ast', 'bilirubin', 'hepatic']):
+                category = "Hepatobiliary Disorders"
+            elif any(x in t for x in ['nausea', 'vomiting', 'diarrhea', 'gastric', 'gi', 'abdominal']):
+                category = "Gastrointestinal Disorders"
+            elif any(x in t for x in ['headache', 'dizziness', 'neuropathy', 'seizure', 'somnolence']):
+                category = "Neurologic Disorders"
+            elif any(x in t for x in ['rash', 'skin', 'dermatitis', 'pruritus', 'urticaria']):
+                category = "Dermatologic Disorders"
+            elif any(x in t for x in ['heart', 'cardiac', 'vascular', 'hypertension', 'blood pressure']):
+                category = "Cardiovascular Disorders"
+            elif any(x in t for x in ['renal', 'kidney', 'creatinine', 'urinary']):
+                category = "Renal/Urinary Disorders"
+            elif any(x in t for x in ['fatigue', 'pyrexia', 'fever', 'chills']):
+                category = "General Disorders"
+            else:
+                category = f"Systemic_{main_ent.label_}"
+            
+            final_mapping[category].append(term)
+        
+        if (i+1) % 50 == 0:
+            print(f"   Done {i+1}/{len(event_list)}...")
 
-    # 3. 儲存結果
-    if final_mapping:
-        with open('categorized_adverse_events.json', 'w', encoding='utf-8') as f:
-            json.dump(final_mapping, f, indent=4)
-        print(f"✨ SUCCESS: Dictionary saved with {len(final_mapping)} SOCs.")
-    else:
-        print("🚨 Error: No data returned from Gemini.")
+    with open('categorized_adverse_events.json', 'w', encoding='utf-8') as f:
+        json.dump(dict(final_mapping), f, indent=4)
+        
+    with open('input-gpt-prompt-organsys.json', 'w', encoding='utf-8') as f:
+        json.dump(dict(final_mapping), f, indent=4)
+
+    print(f"✨ SUCCESS: Saved {len(final_mapping)} categories locally.")
 
 if __name__ == "__main__":
     main()
