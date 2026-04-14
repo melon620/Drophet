@@ -1,0 +1,17 @@
+#!/bin/bash
+# Pre-commit hook to ensure commits only go to Phase-2-(Data-Engineering)
+
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+ALLOWED_BRANCH="Phase-2-(Data-Engineering)"
+
+if [ "$CURRENT_BRANCH" != "$ALLOWED_BRANCH" ]; then
+    echo "❌ ERROR: You are on branch '$CURRENT_BRANCH'"
+    echo "   Only commits to '$ALLOWED_BRANCH' are allowed."
+    echo ""
+    echo "To switch to the correct branch, run:"
+    echo "   git checkout $ALLOWED_BRANCH"
+    echo ""
+    exit 1
+fi
+
+exit 0
