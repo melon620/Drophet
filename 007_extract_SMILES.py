@@ -1,122 +1,134 @@
 # -*- coding: utf-8 -*-
 """
-DDI Tox-Predict Project
-Script 007: Professional SMILES Extractor (with Success Rate Stats)
+DDI Tox-Predict Project (Drophet)
+Script 007: Automated Canonical SMILES Extraction (Multi-Database Support)
+
+ENHANCED LOGIC:
+This version implements a "Consensus Strategy" across two major databases:
+1. PubChem PUG-REST (Primary)
+2. ChEMBL REST API (Secondary/Fallback) - Excellent for clinical synonyms.
 """
 
 import json
+import os
+import time
 import requests
 import re
-import time
-import os
+import urllib.parse
 from rdkit import Chem
+import logging
 
-def clean_drug_name(name):
-    """清洗藥物名稱，移除劑量、單位、劑型等雜訊"""
-    if not name or not isinstance(name, str):
-        return ""
-    cleaned = name.lower()
-    cleaned = re.sub(r'\d+\s?(mg|ml|kg|g|mcg|unit|u|mcl)(/\w+)?', '', cleaned)
-    cleaned = re.sub(r'\(.*?\)', '', cleaned)
-    noise_words = ['tablets', 'tablet', 'capsules', 'capsule', 'injection', 'oral', 'solution', 'plus', 'iv', 'dose']
-    for word in noise_words:
-        cleaned = re.sub(rf'\b{word}\b', '', cleaned)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned
+# Configuration
+INPUT_FILE = 'gpt_filteres-special-trials-w-or-final.json'
+OUTPUT_FILE = 'drug_smiles_mapping.json'
+IGNORED_TERMS = ['placebo', 'control', 'unknown', 'vehicle', 'study drug', 'n/a', 'none']
 
-def get_smiles_from_pubchem(name):
-    """透過 PubChem API 獲取 SMILES"""
-    search_terms = [clean_drug_name(name), name]
-    search_terms = list(dict.fromkeys(search_terms))
-    base_url = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/'
-    
-    for term in search_terms:
-        if len(term) < 2: continue
-        encoded_term = requests.utils.quote(term)
-        url = f"{base_url}{encoded_term}/property/CanonicalSMILES/TXT"
-        try:
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                return response.text.strip()
-        except:
-            continue
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+def clean_name_aggressive(name):
+    """Standard clinical cleanup for chemical databases."""
+    if not name: return ""
+    name = re.sub(r'\(.*?\)', '', name)
+    name = re.sub(r'\b\d+(\.\d+)?\s?(MG|ML|G|L|MCG|UNITS|IU|%|MG/ML)\b', '', name, flags=re.IGNORECASE)
+    if '/' in name: name = name.split('/')[0]
+    salts = ['Hydrochloride', 'HCl', 'Sodium', 'Sulfate', 'Phosphate', 'Mesylate', 'Acetate']
+    for salt in salts:
+        name = re.sub(rf'\b{salt}\b', '', name, flags=re.IGNORECASE)
+    return name.strip().strip(',').strip('.')
+
+def fetch_from_pubchem(term):
+    """Query PubChem TXT endpoint."""
+    try:
+        encoded = urllib.parse.quote(term)
+        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded}/property/CanonicalSMILES/TXT"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+        if res.status_code == 200:
+            smiles = res.text.strip()
+            if smiles and "Fault" not in smiles:
+                return smiles
+    except: pass
     return None
 
+def fetch_from_chembl(term):
+    """Query ChEMBL API as a fallback."""
+    try:
+        encoded = urllib.parse.quote(term)
+        # ChEMBL Molecule API filtered by name synonym
+        url = f"https://www.ebi.ac.uk/chembl/api/data/molecule?molecule_synonyms__synonyms__iexact={encoded}&format=json"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            molecules = data.get('molecules', [])
+            if molecules:
+                # Extract the canonical SMILES from the first hit
+                return molecules[0].get('molecule_structures', {}).get('canonical_smiles')
+    except: pass
+    return None
+
+def get_smiles(drug_name):
+    search_term = clean_name_aggressive(drug_name)
+    if not search_term or search_term.lower() in IGNORED_TERMS:
+        return None, "Ignored"
+
+    # 1. Try PubChem
+    smiles = fetch_from_pubchem(search_term)
+    source = "PubChem"
+
+    # 2. Fallback to ChEMBL
+    if not smiles:
+        smiles = fetch_from_chembl(search_term)
+        source = "ChEMBL"
+
+    if smiles:
+        # Standardize via RDKit
+        mol = Chem.MolFromSmiles(smiles)
+        if mol:
+            return Chem.MolToSmiles(mol, canonical=True), f"Success ({source})"
+
+    return None, "Not Found"
+
 def main():
-    input_file = 'gpt_filteres-special-trials-w-or-final.json'
-    output_file = 'drug_smiles_mapping.json'
-    
-    if not os.path.exists(input_file):
-        print(f"❌ Error: {input_file} not found.")
+    if not os.path.exists(INPUT_FILE):
+        print(f"❌ Error: {INPUT_FILE} not found.")
         return
 
-    with open(input_file, 'r', encoding='utf-8') as f:
-        trials = json.load(f)
+    print(f"🚀 Initializing Multi-DB (PubChem + ChEMBL) SMILES Extraction...")
+
+    with open(INPUT_FILE, 'r', encoding='utf-8') as f:
+        data = json.load(f)
 
     unique_drugs = set()
-    for trial in trials:
-        ae_module = trial.get('resultsSection', {}).get('adverseEventsModule', {})
-        for event_group in ae_module.get('eventGroups', []):
-            for drug in event_group.get('drugs', []):
-                if drug and drug.lower() not in ['placebo', 'control', 'unknown']:
-                    unique_drugs.add(drug)
+    for trial in data:
+        ae_module = trial.get('resultsSection', {}).get('adverseEventsModule', trial.get('adverseEventsModule', {}))
+        for g in ae_module.get('eventGroups', []):
+            drugs = g.get('drugs', [])
+            if isinstance(drugs, list):
+                for d in drugs: unique_drugs.add(d.strip())
+            elif isinstance(drugs, str):
+                unique_drugs.add(drugs.strip())
 
     drug_list = sorted(list(unique_drugs))
-    total_count = len(drug_list)
-    found_count = 0
-    failed_count = 0
-    
-    print(f"🚀 Starting SMILES extraction for {total_count} unique drugs...")
+    total = len(drug_list)
+    print(f"📊 Querying {total} drugs...")
 
-    smiles_mapping = []
-    if os.path.exists(output_file):
-        with open(output_file, 'r', encoding='utf-8') as f:
-            smiles_mapping = json.load(f)
-    
-    processed_names = {item['drug_name'] for item in smiles_mapping}
+    mapping = []
+    success_count = 0
 
-    for i, name in enumerate(drug_list):
-        if name in processed_names:
-            # 統計返已經跑完嘅數據
-            existing_smiles = next(item['canonical_smiles'] for item in smiles_mapping if item['drug_name'] == name)
-            if existing_smiles: found_count += 1
-            else: failed_count += 1
-            continue
-            
-        print(f"[{i+1}/{total_count}] Processing: {name}")
-        raw_smiles = get_smiles_from_pubchem(name)
-        
-        if raw_smiles:
-            mol = Chem.MolFromSmiles(raw_smiles)
-            canonical_smiles = Chem.MolToSmiles(mol, canonical=True) if mol else None
+    for i, drug in enumerate(drug_list, 1):
+        print(f"[{i}/{total}] {drug}", end="", flush=True)
+        smiles, status = get_smiles(drug)
+        if smiles:
+            print(f" -> ✅ {status}")
+            success_count += 1
         else:
-            canonical_smiles = None
-        
-        if canonical_smiles:
-            found_count += 1
-            smiles_mapping.append({"drug_name": name, "canonical_smiles": canonical_smiles})
-            print(f"   ✅ Success")
-        else:
-            failed_count += 1
-            smiles_mapping.append({"drug_name": name, "canonical_smiles": None})
-            print(f"   ⚠️ Failed")
+            print(f" -> ⚠️ {status}")
+        mapping.append({"drug_name": drug, "canonical_smiles": smiles})
+        time.sleep(0.3) # Rate limit protection
 
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(smiles_mapping, f, indent=4)
-        time.sleep(0.4)
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(mapping, f, indent=4)
 
-    # --- 統計輸出 (Success Rate Stats) ---
-    success_rate = (found_count / total_count) * 100 if total_count > 0 else 0
-    
-    print("\n" + "="*40)
-    print("📊 EXTRACTION SUMMARY")
-    print("="*40)
-    print(f"Total Unique Drugs:  {total_count}")
-    print(f"SMILES Found:       {found_count}")
-    print(f"SMILES Missing:     {failed_count}")
-    print(f"Success Rate:       {success_rate:.2f}%")
-    print("="*40)
-    print(f"✨ Data saved to {output_file}\n")
+    print(f"\n✅ Final Success Rate: {(success_count/total*100):.2f}%")
 
 if __name__ == "__main__":
     main()

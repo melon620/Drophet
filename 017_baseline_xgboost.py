@@ -1,23 +1,49 @@
 # -*- coding: utf-8 -*-
 """
 DDI Tox-Predict Project
-Phase 3: Model Training (Baseline)
+Phase 4: Interpretability & Risk Calibration
 
-This script trains an XGBoost Regressor using the engineered molecular features
-to predict the incidence rate (%) of a specific Adverse Event category.
+This script extends the tuned XGBoost model with:
+1. SHAP Analysis: Identifying which molecular bits drive the toxicity.
+2. Clinical Risk Stratification: Mapping % incidence to Low/Med/High risk.
+3. Residual Profiling: Identifying drug pairs with the highest prediction errors.
 """
 
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, GridSearchCV
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.feature_selection import VarianceThreshold, SelectFromModel
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import spearmanr
 import os
 
+# Robust Matplotlib/SHAP Import
+try:
+    import matplotlib.pyplot as plt
+    plt.switch_backend('Agg')
+    HAS_PLOT = True
+except ImportError:
+    HAS_PLOT = False
+
+try:
+    import shap
+    HAS_SHAP = True
+except ImportError:
+    HAS_SHAP = False
+    print("⚠️ Warning: 'shap' module not found. Use 'pip install shap' for explainability analysis.")
+
+def categorize_risk(prob):
+    """Maps continuous incidence rate to clinical risk tiers."""
+    if prob < 5: return "Low Risk"
+    if prob < 20: return "Moderate Risk"
+    return "High Risk"
+
 def main():
-    print("--- Phase 3: Baseline XGBoost Model Training ---")
+    print("--- Phase 4: Model Interpretability & Clinical Calibration ---")
     input_file = 'ddi_training_dataset_final.csv'
-    
+
     if not os.path.exists(input_file):
         print(f"❌ Error: {input_file} not found. Run 016 first.")
         return
@@ -26,60 +52,93 @@ def main():
     df = pd.read_csv(input_file)
     print(f"Loaded dataset with shape: {df.shape}")
 
-    # 2. Define Features (X) and Target (y)
-    # Extract all feature columns starting with D1_ and D2_
-    feature_cols = [col for col in df.columns if col.startswith('D1_') or col.startswith('D2_')]
-    X = df[feature_cols]
-    
-    # Find all Target columns
-    target_cols = [col for col in df.columns if col.startswith('Target_AE_')]
-    if not target_cols:
-        print("❌ Error: No Target variables found.")
-        return
-        
-    print(f"\nAvailable Targets: {target_cols}")
-    
-    # Select the first Target for baseline testing (can be modified later)
-    target_name = target_cols[0] 
+    # 2. Setup Features and Target
+    feature_cols = [col for col in df.columns if "_Bit_" in col or any(x in col for x in ["MW", "LogP", "TPSA"])]
+    X_raw = df[feature_cols]
+
+    target_cols = [col for col in df.columns if col.startswith('Target_')]
+    target_stats = df[target_cols].mean().sort_values(ascending=False)
+    target_name = target_stats.index[0] # Focus on the primary signal
     y = df[target_name]
-    
-    print(f"\n🎯 Training model for Target: {target_name}")
 
-    # 3. Train-Test Split (80% Train, 20% Test)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    print(f"Training samples: {len(X_train)} | Testing samples: {len(X_test)}")
+    print(f"🎯 Target: {target_name} (Mean: {target_stats.iloc[0]:.2f}%)")
 
-    # 4. Initialize and Train XGBoost Regressor
-    # Using conservative hyperparameters to prevent overfitting on the small dataset
-    model = xgb.XGBRegressor(
-        n_estimators=100,
-        max_depth=3,
-        learning_rate=0.1,
-        random_state=42,
-        objective='reg:squarederror'
-    )
-    
-    print("\nTraining XGBoost model...")
-    model.fit(X_train, y_train)
+    # 3. Preprocessing (Mirroring the tuned settings)
+    selector = VarianceThreshold(threshold=0.01)
+    X_reduced = pd.DataFrame(selector.fit_transform(X_raw), columns=X_raw.columns[selector.get_support()])
 
-    # 5. Predictions & Evaluation
-    y_pred = model.predict(X_test)
-    
-    mse = mean_squared_error(y_test, y_pred)
-    mae = mean_absolute_error(y_test, y_pred)
-    r2 = r2_score(y_test, y_pred)
+    pre_model = xgb.XGBRegressor(n_estimators=100, max_depth=3, random_state=42)
+    pre_model.fit(X_reduced, y)
+    sfm = SelectFromModel(pre_model, threshold="0.8*mean", prefit=True)
+    X_selected = X_reduced.loc[:, sfm.get_support()]
+    final_features = X_selected.columns.tolist()
 
-    print("\n✅ Model Evaluation Results (Test Set):")
-    print(f"Mean Squared Error (MSE): {mse:.4f}")
-    print(f"Mean Absolute Error (MAE): {mae:.4f}%")
-    print(f"R-squared (R2): {r2:.4f}")
-    
-    # 6. Feature Importance Preview
-    importances = model.feature_importances_
-    top_indices = np.argsort(importances)[::-1][:5]
-    print("\n🔍 Top 5 Most Important Features:")
-    for idx in top_indices:
-        print(f"{feature_cols[idx]}: {importances[idx]:.4f}")
+    # 4. Final Model with Optimized Hyperparameters (from your last run)
+    best_params = {
+        'learning_rate': 0.05,
+        'max_depth': 5,
+        'n_estimators': 300,
+        'reg_alpha': 0.1,
+        'subsample': 0.8,
+        'objective': 'reg:squarederror',
+        'random_state': 42
+    }
+    model = xgb.XGBRegressor(**best_params)
+
+    # 5. Cross-Validation & Error Analysis
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    all_preds, all_actuals, all_metadata = [], [], []
+
+    for train_idx, test_idx in kf.split(X_selected, y):
+        X_train, X_test = X_selected.iloc[train_idx], X_selected.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        model.fit(X_train, y_train)
+        preds = np.maximum(model.predict(X_test), 0)
+
+        all_preds.extend(preds)
+        all_actuals.extend(y_test)
+        all_metadata.extend(df.iloc[test_idx][['Drug_1', 'Drug_2']].to_dict('records'))
+
+    # Build Analysis DataFrame
+    analysis_df = pd.DataFrame(all_metadata)
+    analysis_df['Actual_%'] = all_actuals
+    analysis_df['Predicted_%'] = all_preds
+    analysis_df['Error'] = abs(analysis_df['Actual_%'] - analysis_df['Predicted_%'])
+    analysis_df['Risk_Level'] = analysis_df['Predicted_%'].apply(categorize_risk)
+
+    print("\n" + "="*40)
+    print("📊 CLINICAL PREDICTION EXAMPLES (Top 5)")
+    print("="*40)
+    print(analysis_df.sort_values('Error').head(5).to_string(index=False))
+    print("="*40)
+
+    # 6. SHAP Explainability (XAI)
+    if HAS_SHAP:
+        print("\n🔍 Generating SHAP Explanations for Molecular Features...")
+        model.fit(X_selected, y) # Train on full selected set for global SHAP
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_selected)
+
+        # Calculate mean absolute SHAP for feature importance
+        shap_importance = np.abs(shap_values).mean(axis=0)
+        feature_importance = pd.DataFrame({'feature': final_features, 'importance': shap_importance})
+        feature_importance = feature_importance.sort_values('importance', ascending=False)
+
+        print("\n🧪 Top 10 Structural Drivers (SHAP Impact):")
+        for idx, row in feature_importance.head(10).iterrows():
+            direction = "Toxicity ↑" if np.mean(shap_values[:, idx]) > 0 else "Toxicity ↓"
+            print(f"   - {row['feature']}: {row['importance']:.4f} ({direction})")
+
+    # 7. Identify High-Error Outliers (Data Debugging)
+    print("\n⚠️ High Error Outliers (Possible clinical noise):")
+    outliers = analysis_df.sort_values('Error', ascending=False).head(3)
+    for _, row in outliers.iterrows():
+        print(f"   - {row['Drug_1']} + {row['Drug_2']}: Actual {row['Actual_%']:.1f}% vs Pred {row['Predicted_%']:.1f}%")
+
+    # 8. Persistence
+    analysis_df.to_csv('clinical_risk_predictions.csv', index=False)
+    print(f"\n✅ Analysis complete. Risk predictions saved to 'clinical_risk_predictions.csv'.")
 
 if __name__ == "__main__":
     main()

@@ -1,109 +1,115 @@
 # -*- coding: utf-8 -*-
+"""
+DDI Tox-Predict Project
+Script 014: Training Matrix Assembly
+
+This script merges three critical data sources into a single flattened CSV:
+1. Adverse Event Distributions (from Script 006)
+2. Drug Group Assignments (from Script 011/013)
+3. Canonical SMILES Mapping (from Script 007)
+"""
+
 import json
 import pandas as pd
 import os
+import logging
 
-def load_json(filepath):
-    if not os.path.exists(filepath):
-        print(f"❌ Error: {filepath} not found!")
-        return []
-    with open(filepath, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-        print(f"📖 Loaded {len(data)} items from {filepath}")
-        return data
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-def get_nctid(item):
-    """
-    通用 NCTId 提取器：嘗試不同層級的路徑
-    """
-    # 1. 嘗試官方層級
-    nctid = item.get('protocolSection', {}).get('identificationModule', {}).get('nctId')
-    # 2. 嘗試頂層 (如果 011/006 做咗簡化)
-    if not nctid:
-        nctid = item.get('nctId') or item.get('NCTId')
-    return nctid
+# Constants
+AE_DIST_FILE = 'trial_adverse_event_distributions_with_data_separated.json'
+DRUG_GROUP_FILE = 'gpt_filteres-special-trials-w-or-final.json'
+SMILES_FILE = 'drug_smiles_mapping.json'
+OUTPUT_FILE = 'training_matrix_raw.csv'
+
+def load_json(path):
+    if not os.path.exists(path):
+        logging.error(f"Missing file: {path}")
+        return None
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
 def main():
-    print("--- Phase 1: Data Merging Process ---")
-    
-    # 1. Load Data
-    distributions_data = load_json('trial_adverse_event_distributions_with_data_separated.json')
-    drug_groups_data = load_json('gpt_filteres-special-trials-w-or-final.json')
-    smiles_mapping = load_json('drug_smiles_mapping.json') 
+    logging.info("--- Phase 1: Training Matrix Assembly ---")
 
-    if not distributions_data:
-        print("🚨 CRITICAL: distributions_data is empty. Check Script 006!")
+    # 1. Load data sources
+    ae_data = load_json(AE_DIST_FILE)
+    group_data = load_json(DRUG_GROUP_FILE)
+    smiles_data = load_json(SMILES_FILE)
+
+    if not all([ae_data, group_data, smiles_data]):
+        logging.error("Pipeline interrupted: Missing input files.")
         return
 
-    # 2. Build SMILES Lookup
-    smiles_dict = {item['drug_name']: item.get('canonical_smiles') for item in smiles_mapping if 'drug_name' in item}
-    print(f"✅ SMILES dictionary built with {len(smiles_dict)} drugs.")
+    # 2. Build SMILES Lookup Dictionary
+    # Mapping: Drug Name -> Canonical SMILES
+    smiles_lookup = {item['drug_name']: item['canonical_smiles'] for item in smiles_data if item.get('canonical_smiles')}
+    logging.info(f"Loaded {len(smiles_lookup)} drug-SMILES mappings.")
 
-    # 3. Build Group-Drug Mapping
-    group_drug_map = {}
-    for trial in drug_groups_data:
-        nct_id = get_nctid(trial)
-        # 處理 011 可能存在的嵌套結構
+    # 3. Build Drug Group Mapping
+    # Mapping: "NCTId_GroupId" -> [List of Drugs]
+    drug_map = {}
+    for trial in group_data:
+        nct_id = trial.get('protocolSection', {}).get('identificationModule', {}).get('nctId') or trial.get('nctId')
         ae_module = trial.get('resultsSection', {}).get('adverseEventsModule', {})
-        event_groups = ae_module.get('eventGroups', [])
-        
-        for eg in event_groups:
-            g_id = eg.get('id')
+        for eg in ae_module.get('eventGroups', []):
+            gid = eg.get('id')
             drugs = eg.get('drugs', [])
-            if nct_id and g_id:
-                group_drug_map[f"{nct_id}_{g_id}"] = drugs
+            if nct_id and gid:
+                drug_map[f"{nct_id}_{gid}"] = drugs
 
-    print(f"✅ Group-Drug map built with {len(group_drug_map)} mapping entries.")
+    # 4. Flatten and Merge
+    matrix_records = []
+    for entry in ae_data:
+        nct_id = entry.get('nctId')
+        # We focus on seriousEvents for the primary toxicity matrix
+        serious_events = entry.get('seriousEvents', {})
 
-    # 4. Flattening Process
-    flattened_records = []
-    for trial in distributions_data:
-        nct_id = get_nctid(trial)
-        
-        # 嘗試搵 AE 分佈 (容許 Script 006 出產唔同層級嘅結構)
-        distributions = trial.get('adverseEventDistributions', trial) 
-        serious_events = distributions.get('seriousEvents', {})
-        
-        if not serious_events:
-            # 萬一 006 output 係直接以 NCTId 為 key 嘅 format (常見於簡化版)
-            serious_events = trial.get('seriousEvents', {})
+        for gid, categories in serious_events.items():
+            lookup_key = f"{nct_id}_{gid}"
+            drugs = drug_map.get(lookup_key, [])
 
-        for group_id, ae_categories in serious_events.items():
-            lookup_key = f"{nct_id}_{group_id}"
-            drugs_in_group = group_drug_map.get(lookup_key, [])
-            
-            drug_1 = drugs_in_group[0] if len(drugs_in_group) > 0 else 'Unknown'
-            drug_2 = drugs_in_group[1] if len(drugs_in_group) > 1 else None
-            
+            # Identify Drug 1 and Drug 2 (if present)
+            d1 = drugs[0] if len(drugs) > 0 else None
+            d2 = drugs[1] if len(drugs) > 1 else None
+
+            # Only include rows where we at least have the primary drug SMILES
+            s1 = smiles_lookup.get(d1)
+            if not s1:
+                continue
+
+            # Create base record
             record = {
                 'NCTId': nct_id,
-                'GroupId': group_id,
-                'Drug_1': drug_1,
-                'Canonical_SMILES_1': smiles_dict.get(drug_1),
-                'Drug_2': drug_2,
-                'Canonical_SMILES_2': smiles_dict.get(drug_2) if drug_2 else None
+                'GroupId': gid,
+                'Drug_1': d1,
+                'SMILES_1': s1,
+                'Drug_2': d2,
+                'SMILES_2': smiles_lookup.get(d2) if d2 else None
             }
-            
-            # 加入 AE Categories
-            for category, percentage in ae_categories.items():
-                clean_cat = str(category).replace(' ', '_').replace('/', '_')
-                record[f"Target_AE_{clean_cat}"] = percentage
-                
-            flattened_records.append(record)
 
-    # 5. Output
-    if not flattened_records:
-        print("🚨 Result is still empty. Debugging info:")
-        if distributions_data:
-            print(f"Sample distribution key: {list(distributions_data[0].keys())}")
+            # Add AE categories as target columns
+            for cat, incidence in categories.items():
+                col_name = f"Target_{cat.replace(' ', '_')}"
+                record[col_name] = incidence
+
+            matrix_records.append(record)
+
+    # 5. Convert to DataFrame and Finalize
+    if not matrix_records:
+        logging.warning("No records were merged. Check if drug names in 007 match 011.")
         return
 
-    df = pd.DataFrame(flattened_records)
-    target_cols = [c for c in df.columns if c.startswith('Target_AE_')]
+    df = pd.DataFrame(matrix_records)
+
+    # Fill NaN targets with 0.0 (meaning 0% incidence reported for that category)
+    target_cols = [c for c in df.columns if c.startswith('Target_')]
     df[target_cols] = df[target_cols].fillna(0.0)
 
-    print(f"🚀 SUCCESS: Final matrix shape: {df.shape}")
-    df.to_csv('training_matrix_raw.csv', index=False)
+    logging.info(f"Successfully assembled matrix with {len(df)} rows and {len(df.columns)} columns.")
+    df.to_csv(OUTPUT_FILE, index=False)
+    logging.info(f"Raw training matrix saved to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
