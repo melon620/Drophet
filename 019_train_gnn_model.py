@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 DDI Tox-Predict Project
-Phase 3: Advanced GNN Modeling (Graph Neural Networks - Symmetrized GIN with Early Stopping)
+Phase 3: Advanced GNN Modeling (Graph Neural Networks - Clinical Research Edition)
 
 This script implements a Siamese Graph Isomorphism Network (GIN) with:
-1. Data Symmetrization: Doubling training data for robustness.
-2. Best Model Tracking: Saving weights based on minimal test MAE.
-3. Enhanced Regularization: Dropout within GIN blocks to prevent overfitting.
-4. Final Result Export: Saving predictions vs actuals for performance auditing.
+1. Training Pipeline: Symmetrized GIN with early stopping.
+2. Inference Engine: Class-based predictor with AUTOMATIC SMILES lookup.
+3. Interactive Mode: Continuous loop for drug-pair screening.
+4. Scaler Persistence: Using pickle to ensure consistent percentage outputs.
 Requirement: training_matrix_refined_for_gnn.csv
 """
 
@@ -25,6 +25,10 @@ from sklearn.metrics import r2_score, mean_absolute_error
 from sklearn.preprocessing import StandardScaler
 import os
 import copy
+import pickle
+import requests
+import urllib.parse
+import sys
 
 # --- 1. Enhanced Graph & Descriptor Engine ---
 
@@ -35,7 +39,6 @@ def get_descriptors(smiles):
     mol = Chem.MolFromSmiles(smiles)
     if not mol:
         return [0.0] * 5
-    # Standardized scaling based on typical drug property ranges
     return [
         Descriptors.MolWt(mol) / 1000.0,
         Descriptors.MolLogP(mol) / 10.0,
@@ -74,15 +77,11 @@ def smiles_to_graph(smiles):
 
 class DDIPairDataset(torch.utils.data.Dataset):
     def __init__(self, df, target_name, target_scaler=None, augment=False):
-        self.df_metadata = df[['Drug_1', 'Drug_2']].reset_index(drop=True)
         self.smiles1 = df['SMILES_1'].values
         self.smiles2 = df['SMILES_2'].values
         self.augment = augment
-
-        # Pre-calculate descriptors
         self.desc1 = np.array([get_descriptors(s) for s in self.smiles1])
         self.desc2 = np.array([get_descriptors(s) for s in self.smiles2])
-
         y = df[target_name].values.reshape(-1, 1)
         self.targets = target_scaler.transform(y) if target_scaler else y
 
@@ -90,25 +89,13 @@ class DDIPairDataset(torch.utils.data.Dataset):
         return len(self.targets) * 2 if self.augment else len(self.targets)
 
     def __getitem__(self, idx):
-        is_swapped = False
-        meta_idx = idx
-        if self.augment and idx >= len(self.targets):
-            meta_idx = idx - len(self.targets)
-            is_swapped = True
-
-        if not is_swapped:
-            s1, s2 = self.smiles1[meta_idx], self.smiles2[meta_idx]
-            d1, d2 = self.desc1[meta_idx], self.desc2[meta_idx]
-        else:
-            s1, s2 = self.smiles2[meta_idx], self.smiles1[meta_idx]
-            d1, d2 = self.desc2[meta_idx], self.desc1[meta_idx]
-
-        g1 = smiles_to_graph(s1)
-        g2 = smiles_to_graph(s2)
-
+        meta_idx = idx if idx < len(self.targets) else idx - len(self.targets)
+        is_swapped = idx >= len(self.targets)
+        s1, s2 = (self.smiles1[meta_idx], self.smiles2[meta_idx]) if not is_swapped else (self.smiles2[meta_idx], self.smiles1[meta_idx])
+        d1, d2 = (self.desc1[meta_idx], self.desc2[meta_idx]) if not is_swapped else (self.desc2[meta_idx], self.desc1[meta_idx])
+        g1, g2 = smiles_to_graph(s1), smiles_to_graph(s2)
         if g1 is None: g1 = Data(x=torch.zeros((1, 6)), edge_index=torch.empty((2, 0), dtype=torch.long), num_nodes=1)
         if g2 is None: g2 = Data(x=torch.zeros((1, 6)), edge_index=torch.empty((2, 0), dtype=torch.long), num_nodes=1)
-
         return g1, g2, torch.tensor(d1, dtype=torch.float), torch.tensor(d2, dtype=torch.float), torch.tensor(self.targets[meta_idx], dtype=torch.float)
 
 # --- 2. Advanced GIN Architecture ---
@@ -116,28 +103,13 @@ class DDIPairDataset(torch.utils.data.Dataset):
 class GNNModel(torch.nn.Module):
     def __init__(self, node_features=6, desc_features=5, hidden_channels=64):
         super(GNNModel, self).__init__()
-
-        # GIN Convolutional layers with Dropout
-        nn1 = torch.nn.Sequential(
-            torch.nn.Linear(node_features, hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(hidden_channels, hidden_channels)
-        )
+        nn1 = torch.nn.Sequential(torch.nn.Linear(node_features, hidden_channels), torch.nn.ReLU(), torch.nn.Dropout(0.2), torch.nn.Linear(hidden_channels, hidden_channels))
         self.conv1 = GINConv(nn1)
         self.ln1 = LayerNorm(hidden_channels)
-
-        nn2 = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels, hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(hidden_channels, hidden_channels)
-        )
+        nn2 = torch.nn.Sequential(torch.nn.Linear(hidden_channels, hidden_channels), torch.nn.ReLU(), torch.nn.Dropout(0.2), torch.nn.Linear(hidden_channels, hidden_channels))
         self.conv2 = GINConv(nn2)
         self.ln2 = LayerNorm(hidden_channels)
-
-        input_dim = (hidden_channels * 2) + (desc_features * 2)
-        self.fc1 = torch.nn.Linear(input_dim, 128)
+        self.fc1 = torch.nn.Linear((hidden_channels * 2) + (desc_features * 2), 128)
         self.fc2 = torch.nn.Linear(128, 64)
         self.out = torch.nn.Linear(64, 1)
 
@@ -148,25 +120,102 @@ class GNNModel(torch.nn.Module):
         return global_add_pool(x, batch) + global_mean_pool(x, batch)
 
     def forward(self, g1, g2, d1, d2):
-        emb1 = self.forward_one(g1)
-        emb2 = self.forward_one(g2)
+        emb1 = self.forward_one(g1); emb2 = self.forward_one(g2)
         combined = torch.cat([emb1, emb2, d1, d2], dim=1)
         x = F.relu(self.fc1(combined))
         x = F.dropout(x, p=0.5, training=self.training)
         x = F.relu(self.fc2(x))
         return self.out(x)
 
+# --- 3. Clinical Inference Tool with Name Lookup ---
+
+class DDIInferenceTool:
+    """A wrapper for using the trained model with automatic drug name to SMILES lookup."""
+    def __init__(self, model_path='ddi_gnn_best_model.pth', scaler_path='target_scaler.pkl'):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = GNNModel().to(self.device)
+        if os.path.exists(model_path):
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        else:
+            raise FileNotFoundError(f"Model weights not found at {model_path}")
+
+        self.model.eval()
+
+        if os.path.exists(scaler_path):
+            with open(scaler_path, 'rb') as f:
+                self.scaler = pickle.load(f)
+        else:
+            raise FileNotFoundError(f"Scaler pkl not found at {scaler_path}")
+
+    def fetch_smiles(self, drug_name):
+        """Fetches canonical SMILES from PubChem API for a given drug name."""
+        try:
+            name = drug_name.strip()
+            encoded = urllib.parse.quote(name)
+            url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded}/property/CanonicalSMILES/TXT"
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200:
+                smiles = res.text.strip()
+                mol = Chem.MolFromSmiles(smiles)
+                if mol:
+                    return Chem.MolToSmiles(mol, canonical=True)
+        except Exception as e:
+            print(f"⚠️ Warning: Could not find SMILES for '{drug_name}': {e}")
+        return None
+
+    def get_risk_tier(self, incidence):
+        if incidence < 5.0: return "🟢 Low Risk"
+        if incidence < 20.0: return "🟡 Moderate Risk"
+        return "🔴 High Risk"
+
+    def predict(self, smiles1, smiles2):
+        """Internal prediction using SMILES."""
+        g1 = smiles_to_graph(smiles1)
+        g2 = smiles_to_graph(smiles2)
+        d1 = torch.tensor([get_descriptors(smiles1)], dtype=torch.float).to(self.device)
+        d2 = torch.tensor([get_descriptors(smiles2)], dtype=torch.float).to(self.device)
+
+        bg1 = Batch.from_data_list([g1]).to(self.device) if g1 else None
+        bg2 = Batch.from_data_list([g2]).to(self.device) if g2 else None
+
+        with torch.no_grad():
+            output = self.model(bg1, bg2, d1, d2)
+            incidence = self.scaler.inverse_transform(output.cpu().numpy())[0][0]
+            incidence = max(0.0, incidence)
+
+        return {
+            "predicted_incidence": f"{incidence:.2f}%",
+            "risk_tier": self.get_risk_tier(incidence)
+        }
+
+    def predict_from_names(self, name1, name2):
+        """The primary user-facing method: takes drug names, fetches SMILES, and predicts."""
+        s1 = self.fetch_smiles(name1)
+        s2 = self.fetch_smiles(name2)
+
+        if not s1 or not s2:
+            missing = []
+            if not s1: missing.append(name1)
+            if not s2: missing.append(name2)
+            return {"error": f"Could not find valid chemical structures for: {', '.join(missing)}"}
+
+        results = self.predict(s1, s2)
+        results["drug1_smiles"] = s1
+        results["drug2_smiles"] = s2
+        return results
+
+# --- 4. Main Workflow ---
+
 def pair_collate(batch):
-    g1_list, g2_list, d1_list, d2_list, targets = zip(*batch)
-    return Batch.from_data_list(g1_list), Batch.from_data_list(g2_list), \
-           torch.stack(d1_list), torch.stack(d2_list), torch.stack(targets)
+    g1, g2, d1, d2, t = zip(*batch)
+    return Batch.from_data_list(g1), Batch.from_data_list(g2), torch.stack(d1), torch.stack(d2), torch.stack(t)
 
-# --- 3. Main Execution ---
-
-def main():
-    print("--- Phase 5: GIN-Descriptor Hybrid Pipeline (Robust Training) ---")
+def train_pipeline():
+    print("--- Phase 5: GIN Training Pipeline Started ---")
     input_file = 'training_matrix_refined_for_gnn.csv'
-    if not os.path.exists(input_file): return
+    if not os.path.exists(input_file):
+        print("❌ Error: Refined matrix not found. Run Script 018 first.")
+        return
 
     df = pd.read_csv(input_file)
     target_name = [c for c in df.columns if c.startswith('Target_')][0]
@@ -175,89 +224,85 @@ def main():
     train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
     target_scaler.fit(train_df[target_name].values.reshape(-1, 1))
 
-    # Keep track of drug names for the test set
-    test_drug_names = test_df[['Drug_1', 'Drug_2']].reset_index(drop=True)
+    with open('target_scaler.pkl', 'wb') as f:
+        pickle.dump(target_scaler, f)
+    print("📁 Target scaler saved to target_scaler.pkl")
 
-    train_loader = DataLoader(DDIPairDataset(train_df, target_name, target_scaler, augment=True),
-                              batch_size=8, shuffle=True, collate_fn=pair_collate)
-    test_loader = DataLoader(DDIPairDataset(test_df, target_name, target_scaler, augment=False),
-                             batch_size=8, shuffle=False, collate_fn=pair_collate)
+    train_loader = DataLoader(DDIPairDataset(train_df, target_name, target_scaler, augment=True), batch_size=8, shuffle=True, collate_fn=pair_collate)
+    test_loader = DataLoader(DDIPairDataset(test_df, target_name, target_scaler, augment=False), batch_size=8, collate_fn=pair_collate)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = GNNModel().to(device)
+    model = GNNModel().to('cpu')
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.1)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20)
     criterion = torch.nn.HuberLoss()
+    best_mae, best_state = float('inf'), None
 
-    best_mae = float('inf')
-    best_model_state = None
-
-    print(f"Training on {device} with Early Stopping Logic...")
-    for epoch in range(1, 401):
+    for epoch in range(1, 201):
         model.train()
-        total_train_loss = 0
         for g1, g2, d1, d2, target in train_loader:
-            g1, g2, d1, d2, target = g1.to(device), g2.to(device), d1.to(device), d2.to(device), target.to(device)
-            optimizer.zero_grad()
-            out = model(g1, g2, d1, d2)
-            loss = criterion(out, target)
-            loss.backward()
-            optimizer.step()
-            total_train_loss += loss.item()
+            optimizer.zero_grad(); out = model(g1, g2, d1, d2); loss = criterion(out, target); loss.backward(); optimizer.step()
 
-        # Periodic Evaluation
         model.eval()
-        total_test_mae = 0
+        total_mae = 0
         with torch.no_grad():
             for g1, g2, d1, d2, target in test_loader:
-                g1, g2, d1, d2, target = g1.to(device), g2.to(device), d1.to(device), d2.to(device), target.to(device)
                 out = model(g1, g2, d1, d2)
-                p = target_scaler.inverse_transform(out.cpu().numpy()).flatten()
-                a = target_scaler.inverse_transform(target.cpu().numpy()).flatten()
-                total_test_mae += mean_absolute_error(a, np.maximum(p, 0))
+                p = target_scaler.inverse_transform(out.numpy()).flatten()
+                a = target_scaler.inverse_transform(target.numpy()).flatten()
+                total_mae += mean_absolute_error(a, np.maximum(p, 0))
 
-        avg_test_mae = total_test_mae / len(test_loader)
-        scheduler.step(total_train_loss / len(train_loader))
+        avg_mae = total_mae / len(test_loader)
+        if avg_mae < best_mae:
+            best_mae = avg_mae
+            best_state = copy.deepcopy(model.state_dict())
+            if epoch % 50 == 0: print(f"   Epoch {epoch} | Best MAE: {best_mae:.4f}")
 
-        if avg_test_mae < best_mae:
-            best_mae = avg_test_mae
-            best_model_state = copy.deepcopy(model.state_dict())
-            if epoch > 50:
-                print(f"   New Best MAE: {best_mae:.4f} at Epoch {epoch}")
-
-        if epoch % 100 == 0:
-            print(f"   Epoch {epoch:03d} | Train Loss: {total_train_loss/len(train_loader):.4f} | Val MAE: {avg_test_mae:.4f}")
-
-    # Load the best state for final evaluation
-    model.load_state_dict(best_model_state)
-    model.eval()
-    preds, actuals = [], []
-    with torch.no_grad():
-        for g1, g2, d1, d2, target in test_loader:
-            g1, g2, d1, d2, target = g1.to(device), g2.to(device), d1.to(device), d2.to(device), target.to(device)
-            out = model(g1, g2, d1, d2)
-            p = target_scaler.inverse_transform(out.cpu().numpy()).flatten()
-            a = target_scaler.inverse_transform(target.cpu().numpy()).flatten()
-            preds.extend(np.maximum(p, 0)); actuals.extend(a)
-
-    print("\n" + "="*40)
-    print("FINAL EVALUATION")
-    print("="*40)
-    final_r2 = r2_score(actuals, preds)
-    final_mae = mean_absolute_error(actuals, preds)
-    print(f"R-squared (R2): {final_r2:.4f}")
-    print(f"MAE:            {final_mae:.4f}%")
-    print("="*40)
-
-    # Save Results for Audit
-    comparison_df = test_drug_names.copy()
-    comparison_df['Actual_Incidence'] = actuals
-    comparison_df['Predicted_Incidence'] = preds
-    comparison_df['Error'] = np.abs(np.array(actuals) - np.array(preds))
-    comparison_df.to_csv('gnn_test_results_comparison.csv', index=False)
-    print(f"📁 Audit CSV saved to 'gnn_test_results_comparison.csv'")
-
-    torch.save(best_model_state, 'ddi_gnn_best_model.pth')
+    torch.save(best_state, 'ddi_gnn_best_model.pth')
+    print("✅ Training complete. Model weights saved.")
 
 if __name__ == "__main__":
-    main()
+    # Artifact Check
+    model_exists = os.path.exists('ddi_gnn_best_model.pth')
+    scaler_exists = os.path.exists('target_scaler.pkl')
+
+    if not (model_exists and scaler_exists):
+        print("🔍 Missing artifacts. Starting training...")
+        train_pipeline()
+    else:
+        print("💎 Found existing model and scaler.")
+
+    print("\n" + "="*50)
+    print("🏥 CLINICAL DDI RISK PREDICTION TOOL (Interactive)")
+    print("Type 'exit' or 'quit' to stop, or press Ctrl+C.")
+    print("="*50)
+
+    try:
+        tool = DDIInferenceTool()
+
+        while True:
+            print("\n" + "-"*30)
+            name_a = input("Enter Drug 1 Name (or 'exit'): ").strip()
+            if name_a.lower() in ['exit', 'quit']: break
+
+            name_b = input("Enter Drug 2 Name: ").strip()
+            if name_b.lower() in ['exit', 'quit']: break
+
+            if not name_a or not name_b:
+                print(" Please enter both drug names.")
+                continue
+
+            print(f"🔍 Analyzing: {name_a} + {name_b}...")
+            result = tool.predict_from_names(name_a, name_b)
+
+            if "error" in result:
+                print(f" Error: {result['error']}")
+            else:
+                print(f" SMILES 1: {result['drug1_smiles']}")
+                print(f" SMILES 2: {result['drug2_smiles']}")
+                print(f" Predicted Incidence: {result['predicted_incidence']}")
+                print(f"  Risk Tier: {result['risk_tier']}")
+            print("-"*30)
+
+    except KeyboardInterrupt:
+        print("\n\n Tool terminated by user.")
+    except Exception as e:
+        print(f"🚨 Inference Error: {e}")
