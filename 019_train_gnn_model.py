@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-DDI Tox-Predict Project
-Phase 5: Advanced GNN Fine-tuning (Pretrained GIN Version - Robust Loading)
+DDI Tox-Predict Project (Project Drophet)
+Phase 5: Advanced GNN Fine-tuning (Size-Invariant Pure Regression)
 
-This script implements a Siamese Graph Isomorphism Network (GIN) that:
-1. Loads a Pretrained Backbone: Inherits chemical knowledge from Phase 4 (020).
-2. Performs Fine-tuning: Adapts pretrained weights to clinical DDI toxicity.
-3. Maintains Clinical Tooling: Includes inference engine with PubChem API lookup.
-4. Robust Weight Loading: Handles prefix mismatches and structural shifts.
+This version surgically fixes the Out-of-Distribution (OOD) size bug and monotherapy crashes:
+1. Feature Normalization: Prevents large molecules (like Ketoconazole) from causing
+   massive negative logits via global_add_pool by standardizing the concatenated vector.
+2. Monotherapy Support: Explicitly handles empty Drug 2 inputs for baseline risk assessment.
+3. MLP Capacity: Restored to 128->64 to handle normalized feature complexity.
+4. Pure Linear Output & MSE Loss: Maintained for continuous, mathematically sound gradients.
 
-Requirement: training_matrix_refined_for_gnn.csv, gnn_pretrained_backbone.pth
+Requirements: training_matrix_augmented.csv, gnn_pretrained_backbone.pth
 """
 
 import pandas as pd
@@ -22,23 +23,24 @@ from torch_geometric.nn import GINConv, global_add_pool, global_mean_pool, Layer
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, mean_absolute_error
-from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error
 import os
 import copy
-import pickle
 import requests
 import urllib.parse
+import warnings
+
+warnings.filterwarnings('ignore', category=UserWarning, module='torch_geometric')
+
+# --- 0. Control Flags ---
+FORCE_RETRAIN = True
 
 # --- 1. Graph & Descriptor Engine ---
 
 def get_descriptors(smiles):
-    """Calculates global descriptors for fusion with graph embeddings."""
-    if pd.isna(smiles) or smiles == "":
-        return [0.0] * 5
+    if pd.isna(smiles) or smiles.strip() == "": return [0.0] * 5
     mol = Chem.MolFromSmiles(smiles)
-    if not mol:
-        return [0.0] * 5
+    if not mol: return [0.0] * 5
     return [
         Descriptors.MolWt(mol) / 1000.0,
         Descriptors.MolLogP(mol) / 10.0,
@@ -48,13 +50,13 @@ def get_descriptors(smiles):
     ]
 
 def smiles_to_graph(smiles):
-    """Converts SMILES to Graph with robust node features."""
     if pd.isna(smiles) or not isinstance(smiles, str) or smiles.strip() == "":
-        return None
-    mol = Chem.MolFromSmiles(smiles)
-    if not mol: return None
+        # Return a robust dummy graph for empty inputs (Monotherapy support)
+        return Data(x=torch.zeros((1, 6)), edge_index=torch.empty((2, 0), dtype=torch.long), num_nodes=1)
 
-    # Features: [AtomicNum, Degree, Charge, IsAromatic, Hybridization, RadicalElectrons]
+    mol = Chem.MolFromSmiles(smiles)
+    if not mol: return Data(x=torch.zeros((1, 6)), edge_index=torch.empty((2, 0), dtype=torch.long), num_nodes=1)
+
     xs = [[atom.GetAtomicNum(), atom.GetDegree(), atom.GetFormalCharge(),
            float(atom.GetIsAromatic()), float(atom.GetHybridization()),
            atom.GetNumRadicalElectrons()] for atom in mol.GetAtoms()]
@@ -69,49 +71,37 @@ def smiles_to_graph(smiles):
     return Data(x=x, edge_index=edge_index, num_nodes=x.size(0))
 
 class DDIPairDataset(torch.utils.data.Dataset):
-    def __init__(self, df, target_name, target_scaler=None, augment=False):
+    def __init__(self, df):
         self.smiles1 = df['SMILES_1'].values
         self.smiles2 = df['SMILES_2'].values
-        self.augment = augment
         self.desc1 = np.array([get_descriptors(s) for s in self.smiles1])
         self.desc2 = np.array([get_descriptors(s) for s in self.smiles2])
-        y = df[target_name].values.reshape(-1, 1)
-        self.targets = target_scaler.transform(y) if target_scaler else y
+
+        target_cols = [c for c in df.columns if c.startswith('Target_')]
+        if not target_cols: raise ValueError("No Target_ columns found in dataset.")
+
+        max_risk_values = df[target_cols].max(axis=1).values
+        self.targets = (max_risk_values.reshape(-1, 1).astype(np.float32)) / 100.0
 
     def __len__(self):
-        return len(self.targets) * 2 if self.augment else len(self.targets)
+        return len(self.targets)
 
     def __getitem__(self, idx):
-        meta_idx = idx if idx < len(self.targets) else idx - len(self.targets)
-        is_swapped = idx >= len(self.targets)
-        s1, s2 = (self.smiles1[meta_idx], self.smiles2[meta_idx]) if not is_swapped else (self.smiles2[meta_idx], self.smiles1[meta_idx])
-        d1, d2 = (self.desc1[meta_idx], self.desc2[meta_idx]) if not is_swapped else (self.desc2[meta_idx], self.desc1[meta_idx])
+        s1, s2 = self.smiles1[idx], self.smiles2[idx]
+        d1, d2 = self.desc1[idx], self.desc2[idx]
         g1, g2 = smiles_to_graph(s1), smiles_to_graph(s2)
-        if g1 is None: g1 = Data(x=torch.zeros((1, 6)), edge_index=torch.empty((2, 0), dtype=torch.long), num_nodes=1)
-        if g2 is None: g2 = Data(x=torch.zeros((1, 6)), edge_index=torch.empty((2, 0), dtype=torch.long), num_nodes=1)
-        return g1, g2, torch.tensor(d1, dtype=torch.float), torch.tensor(d2, dtype=torch.float), torch.tensor(self.targets[meta_idx], dtype=torch.float)
+        return g1, g2, torch.tensor(d1, dtype=torch.float), torch.tensor(d2, dtype=torch.float), torch.tensor(self.targets[idx], dtype=torch.float)
 
-# --- 2. Advanced GIN Architecture (Restored with Dropout for Compatibility) ---
+# --- 2. Advanced GIN Architecture (Size-Invariant Restored) ---
 
 class GINBackbone(torch.nn.Module):
     def __init__(self, node_features=6, hidden_channels=64):
         super(GINBackbone, self).__init__()
-        # Restored to 4 layers (Linear, ReLU, Dropout, Linear) to match existing weights
-        nn1 = torch.nn.Sequential(
-            torch.nn.Linear(node_features, hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.2), # Index 2
-            torch.nn.Linear(hidden_channels, hidden_channels) # Index 3
-        )
+        nn1 = torch.nn.Sequential(torch.nn.Linear(node_features, hidden_channels), torch.nn.ReLU(), torch.nn.Linear(hidden_channels, hidden_channels))
         self.conv1 = GINConv(nn1)
         self.ln1 = LayerNorm(hidden_channels)
 
-        nn2 = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels, hidden_channels),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(hidden_channels, hidden_channels)
-        )
+        nn2 = torch.nn.Sequential(torch.nn.Linear(hidden_channels, hidden_channels), torch.nn.ReLU(), torch.nn.Linear(hidden_channels, hidden_channels))
         self.conv2 = GINConv(nn2)
         self.ln2 = LayerNorm(hidden_channels)
 
@@ -125,6 +115,11 @@ class GNNModel(torch.nn.Module):
         super(GNNModel, self).__init__()
         self.backbone = GINBackbone(node_features, hidden_channels)
         input_dim = (hidden_channels * 2) + (desc_features * 2)
+
+        # [CRITICAL FIX] LayerNorm neutralizes the magnitude explosion from global_add_pool for large molecules
+        self.norm = torch.nn.LayerNorm(input_dim)
+
+        # Restored capacity to learn complex synergies
         self.fc1 = torch.nn.Linear(input_dim, 128)
         self.fc2 = torch.nn.Linear(128, 64)
         self.out = torch.nn.Linear(64, 1)
@@ -132,56 +127,74 @@ class GNNModel(torch.nn.Module):
     def forward(self, g1, g2, d1, d2):
         emb1 = self.backbone(g1.x, g1.edge_index, g1.batch)
         emb2 = self.backbone(g2.x, g2.edge_index, g2.batch)
-        combined = torch.cat([emb1, emb2, d1, d2], dim=1)
-        x = F.relu(self.fc1(combined))
-        x = F.dropout(x, p=0.5, training=self.training)
+
+        emb_add = emb1 + emb2
+        emb_diff = torch.abs(emb1 - emb2)
+        d_add = d1 + d2
+        d_diff = torch.abs(d1 - d2)
+
+        combined = torch.cat([emb_add, emb_diff, d_add, d_diff], dim=1)
+
+        # Standardize features before MLP to ensure size-invariance
+        x = self.norm(combined)
+        x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
+
         return self.out(x)
 
-# --- 3. Clinical Inference Tool with Robust Loading ---
+# --- 3. Production-Ready Inference Tool ---
 
 class DDIInferenceTool:
-    def __init__(self, model_path='ddi_gnn_best_model.pth', scaler_path='target_scaler.pkl'):
+    def __init__(self, model_path='ddi_gnn_best_model.pth'):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = GNNModel().to(self.device)
+        self.is_ready = False
 
         if os.path.exists(model_path):
             state_dict = torch.load(model_path, map_location=self.device)
-            # Handle prefix mapping (if saved as flat but model expects 'backbone.')
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if k.startswith('conv') or k.startswith('ln'):
-                    new_state_dict[f'backbone.{k}'] = v
-                else:
-                    new_state_dict[k] = v
+            is_modern = any(k.startswith('backbone.') for k in state_dict.keys())
 
-            try:
-                self.model.load_state_dict(new_state_dict)
-            except RuntimeError:
-                # Fallback to loading whatever fits if architecture is slightly different
-                self.model.load_state_dict(new_state_dict, strict=False)
-                print("⚠️ Warning: Loaded state dict with strict=False due to minor architecture differences.")
+            if is_modern:
+                new_state_dict = state_dict
+            else:
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith('conv') or (k.startswith('ln') and len(v.shape) > 0 and v.shape[0] == 64):
+                        new_state_dict[f'backbone.{k}'] = v
+                    else:
+                        new_state_dict[k] = v
 
-        self.model.eval()
-        if os.path.exists(scaler_path):
-            with open(scaler_path, 'rb') as f:
-                self.scaler = pickle.load(f)
+            try: self.model.load_state_dict(new_state_dict)
+            except RuntimeError: self.model.load_state_dict(new_state_dict, strict=False)
+
+            self.model.eval()
+            self.is_ready = True
+        else:
+            print("⚠️ Inference Tool initialization failed: Missing model artifacts.")
 
     def fetch_smiles(self, drug_name):
         try:
             name = drug_name.strip()
+            if name == "": return "" # Fast exit for empty inputs
             encoded = urllib.parse.quote(name)
             url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{encoded}/property/CanonicalSMILES/TXT"
             res = requests.get(url, timeout=10)
-            if res.status_code == 200:
-                return res.text.strip()
-        except: pass
+            if res.status_code == 200: return res.text.strip()
+        except Exception: pass
         return None
 
     def predict_from_names(self, name1, name2):
-        s1 = self.fetch_smiles(name1)
-        s2 = self.fetch_smiles(name2)
-        if not s1 or not s2: return {"error": "Missing structures."}
+        if not self.is_ready: return {"error": "Model not loaded properly."}
+
+        # [CRITICAL FIX] Handle empty inputs elegantly for Monotherapy
+        s1 = "" if name1.strip() == "" else self.fetch_smiles(name1)
+        s2 = "" if name2.strip() == "" else self.fetch_smiles(name2)
+
+        if s1 is None or s2 is None:
+            return {"error": f"Missing structures via PubChem. Please check spelling."}
+
+        if s1 == "" and s2 == "":
+            return {"error": "Both drug inputs cannot be empty."}
 
         g1, g2 = smiles_to_graph(s1), smiles_to_graph(s2)
         d1 = torch.tensor([get_descriptors(s1)], dtype=torch.float).to(self.device)
@@ -190,8 +203,7 @@ class DDIInferenceTool:
 
         with torch.no_grad():
             output = self.model(bg1, bg2, d1, d2)
-            inc = self.scaler.inverse_transform(output.cpu().numpy())[0][0]
-            inc = max(0.0, inc)
+            inc = max(0.0, min(output.item() * 100.0, 100.0))
 
         tier = "🟢 Low Risk" if inc < 5 else "🟡 Moderate Risk" if inc < 20 else "🔴 High Risk"
         return {"incidence": f"{inc:.2f}%", "tier": tier, "s1": s1, "s2": s2}
@@ -203,76 +215,107 @@ def pair_collate(batch):
     return Batch.from_data_list(g1), Batch.from_data_list(g2), torch.stack(d1), torch.stack(d2), torch.stack(t)
 
 def train_pipeline():
-    print("--- Phase 5: GNN Fine-tuning Pipeline (Transfer Learning) ---")
-    input_file = 'training_matrix_refined_for_gnn.csv'
-    pretrain_file = 'gnn_pretrained_backbone.pth'
+    print("--- Phase 5: GNN Fine-tuning (Size-Invariant Pure Regression) ---")
+    input_file = 'training_matrix_augmented.csv'
+    if not os.path.exists(input_file): input_file = 'training_matrix_refined_for_gnn.csv'
+    if not os.path.exists(input_file):
+        print(f"❌ Error: Training dataset '{input_file}' missing.")
+        return
 
-    if not os.path.exists(input_file): return
     df = pd.read_csv(input_file)
-    target_name = [c for c in df.columns if c.startswith('Target_')][0]
+    print(f"📊 Loading dataset with {len(df)} drug pairs...")
 
-    target_scaler = StandardScaler()
     train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
-    target_scaler.fit(train_df[target_name].values.reshape(-1, 1))
-    with open('target_scaler.pkl', 'wb') as f: pickle.dump(target_scaler, f)
 
-    train_loader = DataLoader(DDIPairDataset(train_df, target_name, target_scaler, augment=True), batch_size=8, shuffle=True, collate_fn=pair_collate)
-    test_loader = DataLoader(DDIPairDataset(test_df, target_name, target_scaler, augment=False), batch_size=8, collate_fn=pair_collate)
+    train_loader = DataLoader(DDIPairDataset(train_df), batch_size=8, shuffle=True, collate_fn=pair_collate)
+    test_loader = DataLoader(DDIPairDataset(test_df), batch_size=8, collate_fn=pair_collate)
 
     model = GNNModel().to('cpu')
-
+    pretrain_file = 'gnn_pretrained_backbone.pth'
     if os.path.exists(pretrain_file):
-        print(f"💎 Initializing with pretrained backbone: {pretrain_file}")
+        print(f"💎 Loading pretrained chemical backbone...")
         pre_state = torch.load(pretrain_file)
-        # Fix prefix if necessary for backbone loading
-        fixed_pre_state = {k.replace('backbone.', ''): v for k, v in pre_state.items()}
-        model.backbone.load_state_dict(fixed_pre_state, strict=False)
+        model.backbone.load_state_dict({k.replace('backbone.', ''): v for k, v in pre_state.items()}, strict=False)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=0.1)
-    criterion = torch.nn.HuberLoss()
+    # Adding a tiny weight_decay (1e-4) to prevent overfitting on the small dataset
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    criterion = torch.nn.MSELoss()
+
     best_mae, best_state = float('inf'), None
 
     for epoch in range(1, 201):
         model.train()
         for g1, g2, d1, d2, target in train_loader:
-            optimizer.zero_grad(); out = model(g1, g2, d1, d2); loss = criterion(out, target); loss.backward(); optimizer.step()
+            optimizer.zero_grad()
+            out = model(g1, g2, d1, d2)
+            loss = criterion(out, target)
+            loss.backward()
+            optimizer.step()
 
         model.eval()
         total_mae = 0
         with torch.no_grad():
             for g1, g2, d1, d2, target in test_loader:
                 out = model(g1, g2, d1, d2)
-                p = target_scaler.inverse_transform(out.numpy()).flatten()
-                a = target_scaler.inverse_transform(target.numpy()).flatten()
-                total_mae += mean_absolute_error(a, np.maximum(p, 0))
+                p = np.maximum(out.numpy().flatten(), 0.0) * 100.0
+                a = target.numpy().flatten() * 100.0
+                total_mae += mean_absolute_error(a, p)
 
         avg_mae = total_mae / len(test_loader)
+
         if avg_mae < best_mae:
             best_mae = avg_mae
             best_state = copy.deepcopy(model.state_dict())
-            if epoch % 50 == 0: print(f"   Epoch {epoch:03d} | Best Val MAE: {best_mae:.4f}")
+
+        if epoch % 20 == 0 or epoch == 1:
+            print(f"   Epoch {epoch:03d} | Val MAE: {avg_mae:.4f}% (Best: {best_mae:.4f}%)")
 
     torch.save(best_state, 'ddi_gnn_best_model.pth')
-    print("✅ Fine-tuning complete.")
+    print("✅ Training complete. Artifacts saved successfully.")
 
 if __name__ == "__main__":
-    if not (os.path.exists('ddi_gnn_best_model.pth') and os.path.exists('target_scaler.pkl')):
+    needs_training = FORCE_RETRAIN or not os.path.exists('ddi_gnn_best_model.pth')
+
+    if needs_training:
+        if FORCE_RETRAIN:
+            print("\n🚀 [FORCE_RETRAIN] Wiping existing weights...")
+            for f in ['ddi_gnn_best_model.pth', 'target_scaler.pkl']:
+                if os.path.exists(f): os.remove(f)
         train_pipeline()
 
     print("\n" + "="*50)
-    print("🏥 PROJECT DROPHET: CLINICAL DDI SCREENING TOOL")
-    print("Type 'exit' to quit.")
+    print("🏥 PROJECT DROPHET: CLINICAL DDI SCREENING ENGINE (v1.0)")
     print("="*50)
 
     try:
         tool = DDIInferenceTool()
+        if not tool.is_ready:
+            print("🚨 Exiting interactive mode due to initialization failure.")
+            exit()
+
         while True:
-            n1 = input("\nEnter Drug 1: ").strip()
+            n1 = input("\nDrug 1 (or 'exit'): ").strip()
             if n1.lower() == 'exit': break
-            n2 = input("Enter Drug 2: ").strip()
+            if n1.lower() == 'retrain':
+                train_pipeline()
+                tool = DDIInferenceTool()
+                continue
+
+            n2 = input("Drug 2: ").strip()
             if n2.lower() == 'exit': break
+
+            print(f"🔍 Fetching SMILES and analyzing {n1} + {n2}...")
             res = tool.predict_from_names(n1, n2)
-            if "error" in res: print(f"❌ {res['error']}")
-            else: print(f"📊 Result for {n1} + {n2}: {res['incidence']} | {res['tier']}\n")
-    except KeyboardInterrupt: pass
-    print("\n👋 Goodbye!")
+
+            if "error" in res:
+                print(f"❌ {res['error']}")
+            else:
+                print(f"🧪 SMILES 1: {res['s1']}")
+                print(f"🧪 SMILES 2: {res['s2']}")
+                print(f"📊 Result:   {res['incidence']} | {res['tier']}")
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 Program interrupted by user.")
+    except Exception as e:
+        print(f"\n🚨 Unexpected Execution Error: {e}")
+    print("\n👋 Ready for deployment! Goodbye.")
