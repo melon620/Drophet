@@ -19,6 +19,10 @@ from sklearn.preprocessing import StandardScaler
 from scipy.stats import spearmanr
 import os
 
+from drophet_utils import seed_everything
+
+seed_everything(42)
+
 # Robust Matplotlib/SHAP Import
 try:
     import matplotlib.pyplot as plt

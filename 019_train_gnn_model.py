@@ -22,7 +22,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GINConv, global_add_pool, global_mean_pool, LayerNorm
 from rdkit import Chem
 from rdkit.Chem import Descriptors
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import mean_absolute_error
 import os
 import copy
@@ -30,7 +30,12 @@ import requests
 import urllib.parse
 import warnings
 
+from drophet_utils import seed_everything, pair_keys
+
 warnings.filterwarnings('ignore', category=UserWarning, module='torch_geometric')
+
+SEED = 42
+seed_everything(SEED)
 
 # --- 0. Control Flags ---
 FORCE_RETRAIN = True
@@ -225,9 +230,31 @@ def train_pipeline():
     df = pd.read_csv(input_file)
     print(f"📊 Loading dataset with {len(df)} drug pairs...")
 
-    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+    # --- Pair-aware split ---
+    # Previously: a plain random split could put "Aspirin+Warfarin" in train
+    # and "Warfarin+Aspirin" (or a duplicate) in test, leaking labels.
+    # We now group by an order-invariant pair key so the same pair never
+    # appears on both sides of the split.
+    if not {'Drug_1', 'Drug_2'}.issubset(df.columns):
+        raise ValueError("Expected 'Drug_1' and 'Drug_2' columns for pair-aware split.")
 
-    train_loader = DataLoader(DDIPairDataset(train_df), batch_size=8, shuffle=True, collate_fn=pair_collate)
+    groups = pair_keys(df['Drug_1'].values, df['Drug_2'].values)
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
+    train_idx, test_idx = next(splitter.split(df, groups=groups))
+    train_df, test_df = df.iloc[train_idx].reset_index(drop=True), df.iloc[test_idx].reset_index(drop=True)
+
+    # Sanity check: zero overlap of canonical pair keys between splits.
+    train_keys = set(pair_keys(train_df['Drug_1'].values, train_df['Drug_2'].values))
+    test_keys = set(pair_keys(test_df['Drug_1'].values, test_df['Drug_2'].values))
+    overlap = train_keys & test_keys
+    if overlap:
+        raise RuntimeError(f"Pair leakage between train/test: {len(overlap)} overlapping keys.")
+    print(f"   Split: {len(train_df)} train / {len(test_df)} test, no pair overlap.")
+
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    train_loader = DataLoader(DDIPairDataset(train_df), batch_size=8, shuffle=True,
+                              collate_fn=pair_collate, generator=g)
     test_loader = DataLoader(DDIPairDataset(test_df), batch_size=8, collate_fn=pair_collate)
 
     model = GNNModel().to('cpu')
