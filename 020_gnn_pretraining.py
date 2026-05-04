@@ -21,6 +21,10 @@ from sklearn.preprocessing import StandardScaler
 import os
 import copy
 
+from drophet_utils import seed_everything
+
+seed_everything(42)
+
 # --- 1. Data Generation / Fetching ---
 
 def get_extensive_descriptors(smiles):

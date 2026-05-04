@@ -41,6 +41,27 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# Data files (optional)
+# Data files (optional — force-add curated reference JSONs with `git add -f`)
 *.csv
 *.json
+
+# Model artifacts: these belong in a model registry / DVC, not in git.
+# Existing .pth files in this repo are tracked from earlier history; new ones
+# should not be committed. Run `git rm --cached <file>.pth` to untrack.
+*.pth
+*.pkl
+*.onnx
+*.joblib
+
+# Local logs / experiment runs
+logs/
+runs/
+mlruns/
+wandb/
+*.log
+
+# Secrets
+.env
+.env.*
+secrets/
+

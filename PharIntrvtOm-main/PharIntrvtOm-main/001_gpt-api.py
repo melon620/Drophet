@@ -6,14 +6,33 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-openai.api_requestor.APIRequestor.request_timeout = 1200  # Set timeout to 1200 seconds (20 minutes)
+openai.api_requestor.APIRequestor.request_timeout = 1200  # 20 minutes
 
-# Set your OpenAI API key
+# --- API key (fail loudly if missing) ---
 openai.api_key = os.getenv('OPENAI_API_KEY')
+if not openai.api_key:
+    raise RuntimeError(
+        "OPENAI_API_KEY is not set. Add it to a .env file at the project root "
+        "or export it in your shell before running this script."
+    )
 
+# --- Input data path (configurable via env var) ---
+# Default points at a path-relative file so the script works for anyone who
+# clones the repo. Override DROPHET_TRIALS_JSON to point at a different
+# curated trials file.
+DEFAULT_TRIALS_JSON = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'ctg-filtered-drug-trials.json',
+)
+TRIALS_JSON = os.getenv('DROPHET_TRIALS_JSON', DEFAULT_TRIALS_JSON)
 
-# Load the JSON data
-with open('/Users/marie/dev/clinical_trials/ctg-filtered-drug-trials.json', 'r') as file:
+if not os.path.exists(TRIALS_JSON):
+    raise FileNotFoundError(
+        f"Could not find trials JSON at '{TRIALS_JSON}'. Set DROPHET_TRIALS_JSON "
+        "to the absolute path of your ctg-filtered-drug-trials.json file."
+    )
+
+with open(TRIALS_JSON, 'r') as file:
     data = json.load(file)
 
 # Define the prompt for GPT

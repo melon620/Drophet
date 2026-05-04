@@ -247,9 +247,18 @@
     <!-- Javascript Logic -->
     <script>
         // --- GEMINI API CONFIGURATION ---
-        const apiKey = ""; // API Key provided by execution environment
+        // SECURITY: Never hardcode a real API key in client-side HTML — anyone
+        // loading this page can read it. For production, proxy Gemini calls
+        // through a backend that holds the key as a server-side secret.
+        // For local development you can paste a key into window.GEMINI_API_KEY
+        // (e.g. via the browser console) before invoking any LLM feature.
+        const apiKey = (typeof window !== "undefined" && window.GEMINI_API_KEY) || "";
         const geminiModel = "gemini-2.5-flash-preview-09-2025";
         const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`;
+        if (!apiKey) {
+            console.warn("[Drophet] Gemini API key not set. LLM-powered features are disabled. " +
+                "See the comment in this script for setup instructions.");
+        }
 
         // Exponential backoff fetch
         async function fetchWithBackoff(url, options, retries = 5) {
