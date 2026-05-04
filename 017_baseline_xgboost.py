@@ -90,8 +90,14 @@ def main():
     model = xgb.XGBRegressor(**best_params)
 
     # 5. Cross-Validation & Error Analysis
+    # SHAP values are accumulated PER FOLD on each fold's held-out test rows so
+    # that the explanation matrix matches the OOF predictions. Refitting on the
+    # full dataset for global SHAP (the prior approach) leaks every row into
+    # the explainer, making the SHAP attributions inconsistent with the
+    # CV metrics reported below.
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     all_preds, all_actuals, all_metadata = [], [], []
+    fold_shap_values = []
 
     for train_idx, test_idx in kf.split(X_selected, y):
         X_train, X_test = X_selected.iloc[train_idx], X_selected.iloc[test_idx]
@@ -103,6 +109,10 @@ def main():
         all_preds.extend(preds)
         all_actuals.extend(y_test)
         all_metadata.extend(df.iloc[test_idx][['Drug_1', 'Drug_2']].to_dict('records'))
+
+        if HAS_SHAP:
+            explainer = shap.TreeExplainer(model)
+            fold_shap_values.append(explainer.shap_values(X_test))
 
     # Build Analysis DataFrame
     analysis_df = pd.DataFrame(all_metadata)
@@ -117,21 +127,19 @@ def main():
     print(analysis_df.sort_values('Error').head(5).to_string(index=False))
     print("="*40)
 
-    # 6. SHAP Explainability (XAI)
-    if HAS_SHAP:
-        print("\n🔍 Generating SHAP Explanations for Molecular Features...")
-        model.fit(X_selected, y) # Train on full selected set for global SHAP
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X_selected)
+    # 6. SHAP Explainability (XAI) — aggregated across out-of-fold predictions
+    if HAS_SHAP and fold_shap_values:
+        print("\n🔍 Aggregating out-of-fold SHAP attributions...")
+        oof_shap = np.vstack(fold_shap_values)
 
-        # Calculate mean absolute SHAP for feature importance
-        shap_importance = np.abs(shap_values).mean(axis=0)
+        shap_importance = np.abs(oof_shap).mean(axis=0)
         feature_importance = pd.DataFrame({'feature': final_features, 'importance': shap_importance})
         feature_importance = feature_importance.sort_values('importance', ascending=False)
 
         print("\n🧪 Top 10 Structural Drivers (SHAP Impact):")
-        for idx, row in feature_importance.head(10).iterrows():
-            direction = "Toxicity ↑" if np.mean(shap_values[:, idx]) > 0 else "Toxicity ↓"
+        for _, row in feature_importance.head(10).iterrows():
+            col_idx = final_features.index(row['feature'])
+            direction = "Toxicity ↑" if np.mean(oof_shap[:, col_idx]) > 0 else "Toxicity ↓"
             print(f"   - {row['feature']}: {row['importance']:.4f} ({direction})")
 
     # 7. Identify High-Error Outliers (Data Debugging)

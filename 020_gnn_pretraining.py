@@ -18,6 +18,7 @@ from torch_geometric.nn import GINConv, global_add_pool, global_mean_pool, Layer
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 import os
 import copy
 
@@ -59,7 +60,12 @@ def smiles_to_graph(smiles):
     return Data(x=x, edge_index=edge_index, num_nodes=x.size(0))
 
 class PretrainDataset(torch.utils.data.Dataset):
-    def __init__(self, smiles_list):
+    def __init__(self, smiles_list, scaler=None):
+        """
+        If scaler is None, fit a fresh StandardScaler on this split's targets
+        (use this for the train split). Otherwise apply the provided scaler
+        with transform-only (use this for val/test splits).
+        """
         self.data_list = []
         self.targets = []
         print(f"⌛ Processing {len(smiles_list)} molecules for pretraining...")
@@ -75,8 +81,12 @@ class PretrainDataset(torch.utils.data.Dataset):
             raise ValueError("No valid molecules found for pretraining. Check your SMILES data.")
 
         self.targets = np.array(self.targets)
-        self.scaler = StandardScaler()
-        self.targets_scaled = self.scaler.fit_transform(self.targets)
+        if scaler is None:
+            self.scaler = StandardScaler()
+            self.targets_scaled = self.scaler.fit_transform(self.targets)
+        else:
+            self.scaler = scaler
+            self.targets_scaled = self.scaler.transform(self.targets)
 
     def __len__(self): return len(self.data_list)
     def __getitem__(self, idx):
@@ -134,20 +144,25 @@ def main():
 
     # Note: For actual pretraining, you want thousands of SMILES.
     # Here we use the unique set and encourage the model to learn their intrinsic properties.
-    dataset = PretrainDataset(unique_smiles)
-    # Using the updated DataLoader from torch_geometric.loader
-    loader = DataLoader(dataset, batch_size=16, shuffle=True)
+    # Split SMILES first, then fit the scaler on the train split only to avoid
+    # leaking target statistics from val into the pretraining objective.
+    train_smiles, val_smiles = train_test_split(unique_smiles, test_size=0.1, random_state=42)
+    train_dataset = PretrainDataset(train_smiles, scaler=None)
+    val_dataset = PretrainDataset(val_smiles, scaler=train_dataset.scaler)
+
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
     backbone = GINBackbone(node_features=6, hidden_channels=64)
     model = PretrainModel(backbone)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
     criterion = torch.nn.MSELoss()
 
-    print(f"Training Backbone on {len(unique_smiles)} unique structures...")
-    model.train()
+    print(f"Training Backbone on {len(train_dataset)} structures, validating on {len(val_dataset)}...")
     for epoch in range(1, 101):
+        model.train()
         total_loss = 0
-        for data, target in loader:
+        for data, target in train_loader:
             optimizer.zero_grad()
             out = model(data)
             loss = criterion(out, target)
@@ -156,7 +171,13 @@ def main():
             total_loss += loss.item()
 
         if epoch % 20 == 0:
-            print(f"   Epoch {epoch:03d} | Pretrain Loss: {total_loss/len(loader):.4f}")
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for data, target in val_loader:
+                    val_loss += criterion(model(data), target).item()
+            val_loss = val_loss / max(len(val_loader), 1)
+            print(f"   Epoch {epoch:03d} | Pretrain Loss: {total_loss/len(train_loader):.4f} | Val Loss: {val_loss:.4f}")
 
     # Save ONLY the backbone weights
     torch.save(backbone.state_dict(), 'gnn_pretrained_backbone.pth')
