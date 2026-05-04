@@ -262,7 +262,27 @@ def train_pipeline():
     if os.path.exists(pretrain_file):
         print(f"💎 Loading pretrained chemical backbone...")
         pre_state = torch.load(pretrain_file)
-        model.backbone.load_state_dict({k.replace('backbone.', ''): v for k, v in pre_state.items()}, strict=False)
+        # Tolerate either a raw GINBackbone state dict (script 020 saves this)
+        # or a wrapped one with a 'backbone.' prefix, but verify the keys line up
+        # exactly. Silently dropping mismatches with strict=False masks
+        # architecture drift between pretraining and finetuning.
+        cleaned_state = {k.replace('backbone.', '', 1): v for k, v in pre_state.items()}
+
+        expected_keys = set(model.backbone.state_dict().keys())
+        incoming_keys = set(cleaned_state.keys())
+        missing = expected_keys - incoming_keys
+        unexpected = incoming_keys - expected_keys
+        if missing:
+            raise RuntimeError(
+                f"Pretrained backbone is missing required keys: {sorted(missing)}. "
+                f"Architecture drift between 020 and 019 — retrain the backbone."
+            )
+        if unexpected:
+            print(f"   ⚠️ Pretrained file contains unexpected keys (ignored): {sorted(unexpected)}")
+            cleaned_state = {k: v for k, v in cleaned_state.items() if k in expected_keys}
+
+        model.backbone.load_state_dict(cleaned_state, strict=True)
+        print(f"   ✅ Loaded {len(cleaned_state)} backbone tensors (strict).")
 
     # Adding a tiny weight_decay (1e-4) to prevent overfitting on the small dataset
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
