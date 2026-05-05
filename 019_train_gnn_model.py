@@ -208,7 +208,12 @@ class DDIInferenceTool:
 
         with torch.no_grad():
             output = self.model(bg1, bg2, d1, d2)
-            inc = max(0.0, min(output.item() * 100.0, 100.0))
+            # Surface the magnitude of the model output instead of flooring
+            # negatives to 0%. The single-output head can produce small
+            # negative values (post-LayerNorm + ReLU MLP, the final Linear
+            # is unconstrained), and clamping them to 0 hides relative
+            # signal between pairs that all happen to land below zero.
+            inc = min(abs(output.item()) * 100.0, 100.0)
 
         tier = "🟢 Low Risk" if inc < 5 else "🟡 Moderate Risk" if inc < 20 else "🔴 High Risk"
         return {"incidence": f"{inc:.2f}%", "tier": tier, "s1": s1, "s2": s2}
