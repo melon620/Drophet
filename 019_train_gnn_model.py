@@ -139,7 +139,7 @@ class GINBackbone(torch.nn.Module):
         return global_add_pool(x, batch) + global_mean_pool(x, batch)
 
 class GNNModel(torch.nn.Module):
-    def __init__(self, node_features=6, desc_features=5, hidden_channels=64, n_outputs=1):
+    def __init__(self, node_features=6, desc_features=5, hidden_channels=64, n_outputs=1, dropout_p=0.1):
         super(GNNModel, self).__init__()
         self.backbone = GINBackbone(node_features, hidden_channels)
         input_dim = (hidden_channels * 2) + (desc_features * 2)
@@ -150,6 +150,10 @@ class GNNModel(torch.nn.Module):
         # Restored capacity to learn complex synergies
         self.fc1 = torch.nn.Linear(input_dim, 128)
         self.fc2 = torch.nn.Linear(128, 64)
+        # Dropout is parameter-free, so legacy checkpoints still load.
+        # MC-Dropout uses these at inference (toggled in DDIInferenceTool).
+        self.dropout1 = torch.nn.Dropout(p=dropout_p)
+        self.dropout2 = torch.nn.Dropout(p=dropout_p)
         self.out = torch.nn.Linear(64, n_outputs)
         self.n_outputs = n_outputs
 
@@ -166,8 +170,8 @@ class GNNModel(torch.nn.Module):
 
         # Standardize features before MLP to ensure size-invariance
         x = self.norm(combined)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.dropout1(F.relu(self.fc1(x)))
+        x = self.dropout2(F.relu(self.fc2(x)))
 
         return self.out(x)
 
@@ -277,6 +281,70 @@ class DDIInferenceTool:
             "s1": s1,
             "s2": s2,
             "breakdown": breakdown,
+        }
+
+    def predict_with_uncertainty(self, name1, name2, n_samples=20):
+        """MC-Dropout: run n_samples forward passes with dropout enabled,
+        return mean ± std of the top-line incidence estimate. Provides a
+        cheap epistemic-uncertainty signal users can compare against the
+        point estimate to flag low-confidence predictions."""
+        if not self.is_ready:
+            return {"error": "Model not loaded properly."}
+
+        s1 = "" if name1.strip() == "" else self.fetch_smiles(name1)
+        s2 = "" if name2.strip() == "" else self.fetch_smiles(name2)
+        if s1 is None or s2 is None:
+            return {"error": "Missing structures via PubChem. Please check spelling."}
+        if s1 == "" and s2 == "":
+            return {"error": "Both drug inputs cannot be empty."}
+
+        g1, g2 = smiles_to_graph(s1), smiles_to_graph(s2)
+        d1 = torch.tensor([get_descriptors(s1)], dtype=torch.float).to(self.device)
+        d2 = torch.tensor([get_descriptors(s2)], dtype=torch.float).to(self.device)
+        bg1 = Batch.from_data_list([g1]).to(self.device)
+        bg2 = Batch.from_data_list([g2]).to(self.device)
+
+        # Toggle dropout layers into training mode while keeping the rest
+        # in eval (BatchNorm/LayerNorm running stats stay frozen).
+        for m in self.model.modules():
+            if isinstance(m, torch.nn.Dropout):
+                m.train()
+            else:
+                m.eval()
+
+        samples = []
+        with torch.no_grad():
+            for _ in range(n_samples):
+                out = self.model(bg1, bg2, d1, d2)
+                arr = np.minimum(np.abs(out.cpu().numpy().flatten()) * 100.0, 100.0)
+                samples.append(arr)
+
+        # Restore full eval mode for subsequent point predictions.
+        self.model.eval()
+
+        samples = np.vstack(samples)              # (n_samples, n_outputs)
+        mean = samples.mean(axis=0)
+        std = samples.std(axis=0)
+        top_inc_mean = float(mean.max()) if mean.size else 0.0
+        top_inc_std = float(std[mean.argmax()]) if mean.size else 0.0
+
+        breakdown = []
+        if self.target_cols and len(self.target_cols) == mean.size:
+            breakdown = sorted(
+                [(c, float(m_), float(s_)) for c, m_, s_ in zip(self.target_cols, mean, std)],
+                key=lambda t: t[1], reverse=True,
+            )
+
+        tier = ("🟢 Low Risk" if top_inc_mean < 5
+                else "🟡 Moderate Risk" if top_inc_mean < 20
+                else "🔴 High Risk")
+        return {
+            "incidence_mean": f"{top_inc_mean:.2f}%",
+            "incidence_std": f"±{top_inc_std:.2f}%",
+            "tier": tier,
+            "s1": s1, "s2": s2,
+            "breakdown_with_std": breakdown,
+            "n_samples": n_samples,
         }
 
 # --- 4. Training Pipeline ---

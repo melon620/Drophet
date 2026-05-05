@@ -74,29 +74,53 @@ def fetch_smiles(drug_name):
 
 # --- 3. Main Execution ---
 
+def _canonical_pair_key(d1, d2):
+    def _norm(x):
+        if x is None:
+            return ""
+        s = str(x).strip()
+        return "" if s.lower() in ("nan", "none") else s.lower()
+    a, b = sorted([_norm(d1), _norm(d2)])
+    return f"{a}||{b}"
+
+
 def main():
-    print("--- Phase 4.5: Generating Negative Controls & Resetting Environment ---")
+    print("--- Phase 4.5: Generating Negative Controls (Safety Augmentation) ---")
 
     input_file = 'training_matrix_refined_for_gnn.csv'
-    backup_file = 'training_matrix_refined_for_gnn_backup.csv'
+    output_file = 'training_matrix_augmented.csv'
 
     if not os.path.exists(input_file):
         print(f"❌ Error: Could not find {input_file}. Please run Phase 3 scripts first.")
         return
 
-    # 1. Backup the original file safely
-    if not os.path.exists(backup_file):
-        shutil.copy(input_file, backup_file)
-        print(f"💾 Backed up original matrix to '{backup_file}'")
-
     df_original = pd.read_csv(input_file)
 
+    # Cross-check: any hand-picked SAFE_PAIRS that already appear in the
+    # positive set (in either order) get filtered out. Otherwise we'd
+    # double-label the same pair with both its observed AE rate AND a 0.0%
+    # negative control, which is pure label noise.
+    positive_keys = set()
+    for _, row in df_original.iterrows():
+        positive_keys.add(_canonical_pair_key(row.get('Drug_1'), row.get('Drug_2')))
+
+    filtered_pairs = []
+    skipped_overlap = []
+    for d1, d2 in SAFE_PAIRS:
+        if _canonical_pair_key(d1, d2) in positive_keys:
+            skipped_overlap.append((d1, d2))
+        else:
+            filtered_pairs.append((d1, d2))
+    if skipped_overlap:
+        print(f"⚠️ Skipping {len(skipped_overlap)} hand-picked safe pairs that already "
+              f"appear in the positive set: {skipped_overlap}")
+
     print(f"📊 Current dataset size: {len(df_original)} pairs.")
-    print(f"🔬 Injecting {len(SAFE_PAIRS)} safe control pairs at 0.0% incidence...")
+    print(f"🔬 Injecting {len(filtered_pairs)} safe control pairs at 0.0% incidence...")
 
     new_rows = []
 
-    for i, (drug1, drug2) in enumerate(SAFE_PAIRS):
+    for i, (drug1, drug2) in enumerate(filtered_pairs):
         print(f"[{i+1}/{len(SAFE_PAIRS)}] Processing: {drug1} + {drug2}")
         s1 = fetch_smiles(drug1)
         time.sleep(0.2) # Polite delay for API
@@ -116,35 +140,22 @@ def main():
 
     df_negatives = pd.DataFrame(new_rows)
 
-    # 2. Merge and Shuffle
+    # Merge and Shuffle, write to a NEW file so the input is preserved.
+    # 019 already reads training_matrix_augmented.csv if it exists, falling
+    # back to training_matrix_refined_for_gnn.csv. This way you can rerun
+    # 021 with different SAFE_PAIRS without irrecoverably mutating the
+    # upstream cleaned matrix.
     df_augmented = pd.concat([df_original, df_negatives], ignore_index=True)
     df_augmented = df_augmented.sample(frac=1, random_state=42).reset_index(drop=True)
-
-    # OVERWRITE the original file so Script 019 picks it up automatically
-    df_augmented.to_csv(input_file, index=False)
+    df_augmented.to_csv(output_file, index=False)
 
     print("\n" + "="*40)
     print(f"✅ Success! Generated {len(new_rows)} valid negative samples.")
-    print(f"📦 Overwritten active dataset: '{input_file}'")
+    print(f"📦 Augmented dataset written to: '{output_file}' (original '{input_file}' untouched).")
     print(f"📈 New total dataset size: {len(df_augmented)} pairs.")
     print("="*40)
 
-    # 3. FORCE RETRAINING by deleting old artifacts
-    print("\n🧹 Cleaning up old artifacts to force retraining...")
-    artifacts_to_delete = ['ddi_gnn_best_model.pth', 'target_scaler.pkl']
-    deleted_count = 0
-    for artifact in artifacts_to_delete:
-        if os.path.exists(artifact):
-            os.remove(artifact)
-            print(f"   🗑️ Deleted: {artifact}")
-            deleted_count += 1
-
-    if deleted_count > 0:
-        print("💡 The GNN will now automatically retrain on the augmented data next time you run 019.")
-    else:
-        print("💡 No old artifacts found. Ready for fresh training.")
-
-    print("\n👉 Next Step: Run 'python 019_train_gnn_model.py' to fine-tune the model with the new baseline!")
+    print("\n💡 Run 019 next: it will auto-pick up '{}' over '{}'.".format(output_file, input_file))
 
 if __name__ == "__main__":
     main()

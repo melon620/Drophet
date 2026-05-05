@@ -56,15 +56,34 @@ def predict(drug1: str, drug2: str):
     if not drug1:
         return "Please enter at least Drug 1.", "", "", ""
 
-    res = _tool.predict_from_names(drug1, drug2)
+    # Use the MC-Dropout uncertainty estimator when available; fall back to
+    # the point estimate. Legacy single-output checkpoints load fine since
+    # Dropout has no trained parameters.
+    import torch as _torch
+    has_dropout = (_tool.model is not None and any(
+        isinstance(m, _torch.nn.Dropout) for m in _tool.model.modules()
+    ))
+    if has_dropout and hasattr(_tool, "predict_with_uncertainty"):
+        res = _tool.predict_with_uncertainty(drug1, drug2, n_samples=20)
+    else:
+        res = _tool.predict_from_names(drug1, drug2)
 
     if "error" in res:
         return f"### ❌ {res['error']}", "", "", ""
 
-    summary = (
-        f"### {res['tier']}\n\n"
-        f"**Predicted adverse-event incidence:** {res['incidence']}"
-    )
+    inc_str = res.get("incidence_mean") or res.get("incidence", "?")
+    std_str = res.get("incidence_std", "")
+    lines = [f"### {res['tier']}", "",
+             f"**Predicted adverse-event incidence:** {inc_str} {std_str}".rstrip()]
+    breakdown = res.get("breakdown_with_std") or [(c, p, None) for c, p in (res.get("breakdown") or [])]
+    if breakdown:
+        lines.append("\n**Per-category (top 5):**")
+        for entry in breakdown[:5]:
+            cat, mean = entry[0], entry[1]
+            std = entry[2] if len(entry) > 2 else None
+            lines.append(f"- {cat}: {mean:.2f}%" + (f" ± {std:.2f}%" if std is not None else ""))
+    summary = "\n".join(lines)
+
     inputs_view = (
         f"Drug 1: {drug1}\n"
         f"Drug 2: {drug2 if drug2 else '(monotherapy — no second drug)'}"
