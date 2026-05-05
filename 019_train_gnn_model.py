@@ -76,17 +76,23 @@ def smiles_to_graph(smiles):
     return Data(x=x, edge_index=edge_index, num_nodes=x.size(0))
 
 class DDIPairDataset(torch.utils.data.Dataset):
-    def __init__(self, df):
+    def __init__(self, df, target_cols=None):
         self.smiles1 = df['SMILES_1'].values
         self.smiles2 = df['SMILES_2'].values
         self.desc1 = np.array([get_descriptors(s) for s in self.smiles1])
         self.desc2 = np.array([get_descriptors(s) for s in self.smiles2])
 
-        target_cols = [c for c in df.columns if c.startswith('Target_')]
-        if not target_cols: raise ValueError("No Target_ columns found in dataset.")
+        if target_cols is None:
+            target_cols = sorted([c for c in df.columns if c.startswith('Target_')])
+        if not target_cols:
+            raise ValueError("No Target_ columns found in dataset.")
+        self.target_cols = list(target_cols)
 
-        max_risk_values = df[target_cols].max(axis=1).values
-        self.targets = (max_risk_values.reshape(-1, 1).astype(np.float32)) / 100.0
+        # Multi-task: keep one target per AE category instead of collapsing
+        # them with df.max(axis=1). Max-aggregation throws away the structure
+        # the model is trying to learn — every pair has the same "primary"
+        # signal regardless of which AE actually drove the % rate.
+        self.targets = (df[self.target_cols].values.astype(np.float32)) / 100.0
 
     def __len__(self):
         return len(self.targets)
@@ -116,7 +122,7 @@ class GINBackbone(torch.nn.Module):
         return global_add_pool(x, batch) + global_mean_pool(x, batch)
 
 class GNNModel(torch.nn.Module):
-    def __init__(self, node_features=6, desc_features=5, hidden_channels=64):
+    def __init__(self, node_features=6, desc_features=5, hidden_channels=64, n_outputs=1):
         super(GNNModel, self).__init__()
         self.backbone = GINBackbone(node_features, hidden_channels)
         input_dim = (hidden_channels * 2) + (desc_features * 2)
@@ -127,7 +133,8 @@ class GNNModel(torch.nn.Module):
         # Restored capacity to learn complex synergies
         self.fc1 = torch.nn.Linear(input_dim, 128)
         self.fc2 = torch.nn.Linear(128, 64)
-        self.out = torch.nn.Linear(64, 1)
+        self.out = torch.nn.Linear(64, n_outputs)
+        self.n_outputs = n_outputs
 
     def forward(self, g1, g2, d1, d2):
         emb1 = self.backbone(g1.x, g1.edge_index, g1.batch)
@@ -152,30 +159,47 @@ class GNNModel(torch.nn.Module):
 class DDIInferenceTool:
     def __init__(self, model_path='ddi_gnn_best_model.pth'):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = GNNModel().to(self.device)
         self.is_ready = False
+        self.model = None
+        self.target_cols = None
 
-        if os.path.exists(model_path):
-            state_dict = torch.load(model_path, map_location=self.device)
-            is_modern = any(k.startswith('backbone.') for k in state_dict.keys())
-
-            if is_modern:
-                new_state_dict = state_dict
-            else:
-                new_state_dict = {}
-                for k, v in state_dict.items():
-                    if k.startswith('conv') or (k.startswith('ln') and len(v.shape) > 0 and v.shape[0] == 64):
-                        new_state_dict[f'backbone.{k}'] = v
-                    else:
-                        new_state_dict[k] = v
-
-            try: self.model.load_state_dict(new_state_dict)
-            except RuntimeError: self.model.load_state_dict(new_state_dict, strict=False)
-
-            self.model.eval()
-            self.is_ready = True
-        else:
+        if not os.path.exists(model_path):
             print("⚠️ Inference Tool initialization failed: Missing model artifacts.")
+            return
+
+        loaded = torch.load(model_path, map_location=self.device)
+
+        if isinstance(loaded, dict) and 'model_state' in loaded:
+            # Multi-task format saved by train_pipeline (this file).
+            state_dict = loaded['model_state']
+            self.target_cols = loaded.get('target_cols')
+            n_outputs = int(loaded.get('n_outputs') or
+                            (len(self.target_cols) if self.target_cols else 1))
+        else:
+            # Legacy format: raw state_dict, single output head.
+            state_dict = loaded
+            n_outputs = 1
+            if 'out.weight' in state_dict:
+                n_outputs = state_dict['out.weight'].shape[0]
+
+        self.model = GNNModel(n_outputs=n_outputs).to(self.device)
+
+        is_modern = any(k.startswith('backbone.') for k in state_dict.keys())
+        if is_modern:
+            new_state_dict = state_dict
+        else:
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('conv') or (k.startswith('ln') and len(v.shape) > 0 and v.shape[0] == 64):
+                    new_state_dict[f'backbone.{k}'] = v
+                else:
+                    new_state_dict[k] = v
+
+        try: self.model.load_state_dict(new_state_dict)
+        except RuntimeError: self.model.load_state_dict(new_state_dict, strict=False)
+
+        self.model.eval()
+        self.is_ready = True
 
     def fetch_smiles(self, drug_name):
         try:
@@ -208,10 +232,30 @@ class DDIInferenceTool:
 
         with torch.no_grad():
             output = self.model(bg1, bg2, d1, d2)
-            inc = max(0.0, min(output.item() * 100.0, 100.0))
+            arr = np.clip(output.cpu().numpy().flatten() * 100.0, 0.0, 100.0)
+
+        # Top-line incidence is the worst per-category prediction. Same coarse
+        # semantics as the prior single-head max-aggregated model so existing
+        # callers (Gradio app, CLI prompt) keep working, but we now also
+        # surface the per-category numbers so users can see *which* AE drives
+        # the risk tier instead of one opaque %.
+        inc = float(arr.max()) if arr.size else 0.0
+
+        breakdown = []
+        if self.target_cols and len(self.target_cols) == arr.size:
+            breakdown = sorted(
+                [(c, float(p)) for c, p in zip(self.target_cols, arr)],
+                key=lambda t: t[1], reverse=True,
+            )
 
         tier = "🟢 Low Risk" if inc < 5 else "🟡 Moderate Risk" if inc < 20 else "🔴 High Risk"
-        return {"incidence": f"{inc:.2f}%", "tier": tier, "s1": s1, "s2": s2}
+        return {
+            "incidence": f"{inc:.2f}%",
+            "tier": tier,
+            "s1": s1,
+            "s2": s2,
+            "breakdown": breakdown,
+        }
 
 # --- 4. Training Pipeline ---
 
@@ -251,13 +295,19 @@ def train_pipeline():
         raise RuntimeError(f"Pair leakage between train/test: {len(overlap)} overlapping keys.")
     print(f"   Split: {len(train_df)} train / {len(test_df)} test, no pair overlap.")
 
+    target_cols = sorted([c for c in df.columns if c.startswith('Target_')])
+    if not target_cols:
+        raise ValueError("No Target_ columns found in training dataset.")
+    n_outputs = len(target_cols)
+    print(f"🎯 Multi-task heads: {n_outputs} AE categories ({', '.join(target_cols[:3])}{'...' if n_outputs > 3 else ''})")
+
     g = torch.Generator()
     g.manual_seed(SEED)
-    train_loader = DataLoader(DDIPairDataset(train_df), batch_size=8, shuffle=True,
+    train_loader = DataLoader(DDIPairDataset(train_df, target_cols), batch_size=8, shuffle=True,
                               collate_fn=pair_collate, generator=g)
-    test_loader = DataLoader(DDIPairDataset(test_df), batch_size=8, collate_fn=pair_collate)
+    test_loader = DataLoader(DDIPairDataset(test_df, target_cols), batch_size=8, collate_fn=pair_collate)
 
-    model = GNNModel().to('cpu')
+    model = GNNModel(n_outputs=n_outputs).to('cpu')
     pretrain_file = 'gnn_pretrained_backbone.pth'
     if os.path.exists(pretrain_file):
         print(f"💎 Loading pretrained chemical backbone...")
@@ -266,38 +316,54 @@ def train_pipeline():
 
     # Adding a tiny weight_decay (1e-4) to prevent overfitting on the small dataset
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-    criterion = torch.nn.MSELoss()
+    # L1 (MAE) for both the training objective and the selection metric, so the
+    # loss the optimiser minimises matches the metric we use to pick the best
+    # epoch. Previously: trained on MSE, selected on MAE — those don't agree,
+    # which means the epoch checkpoint we kept wasn't optimal for either.
+    criterion = torch.nn.L1Loss()
 
     best_mae, best_state = float('inf'), None
 
     for epoch in range(1, 201):
         model.train()
+        train_loss = 0.0
         for g1, g2, d1, d2, target in train_loader:
             optimizer.zero_grad()
             out = model(g1, g2, d1, d2)
             loss = criterion(out, target)
             loss.backward()
             optimizer.step()
+            train_loss += loss.item()
 
         model.eval()
-        total_mae = 0
+        total_mae = 0.0
+        n_batches = 0
         with torch.no_grad():
             for g1, g2, d1, d2, target in test_loader:
                 out = model(g1, g2, d1, d2)
-                p = np.maximum(out.numpy().flatten(), 0.0) * 100.0
-                a = target.numpy().flatten() * 100.0
-                total_mae += mean_absolute_error(a, p)
+                p = np.maximum(out.numpy(), 0.0) * 100.0
+                a = target.numpy() * 100.0
+                total_mae += float(np.abs(p - a).mean())
+                n_batches += 1
 
-        avg_mae = total_mae / len(test_loader)
+        avg_mae = total_mae / max(n_batches, 1)
 
         if avg_mae < best_mae:
             best_mae = avg_mae
             best_state = copy.deepcopy(model.state_dict())
 
         if epoch % 20 == 0 or epoch == 1:
-            print(f"   Epoch {epoch:03d} | Val MAE: {avg_mae:.4f}% (Best: {best_mae:.4f}%)")
+            train_avg = train_loss / max(len(train_loader), 1)
+            print(f"   Epoch {epoch:03d} | Train L1: {train_avg:.4f} | Val MAE: {avg_mae:.4f}% (Best: {best_mae:.4f}%)")
 
-    torch.save(best_state, 'ddi_gnn_best_model.pth')
+    # Save state + metadata so DDIInferenceTool knows what each output column
+    # means and how many outputs the head produced. The legacy raw-state-dict
+    # format is still read for backwards compatibility.
+    torch.save({
+        'model_state': best_state,
+        'target_cols': target_cols,
+        'n_outputs': n_outputs,
+    }, 'ddi_gnn_best_model.pth')
     print("✅ Training complete. Artifacts saved successfully.")
 
 if __name__ == "__main__":
@@ -340,6 +406,11 @@ if __name__ == "__main__":
                 print(f"🧪 SMILES 1: {res['s1']}")
                 print(f"🧪 SMILES 2: {res['s2']}")
                 print(f"📊 Result:   {res['incidence']} | {res['tier']}")
+                breakdown = res.get('breakdown') or []
+                if breakdown:
+                    print("📋 Top categories (per-AE %):")
+                    for col, pct in breakdown[:5]:
+                        print(f"     - {col}: {pct:.2f}%")
 
     except KeyboardInterrupt:
         print("\n\n🛑 Program interrupted by user.")
