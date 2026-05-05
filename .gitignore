@@ -60,6 +60,12 @@ mlruns/
 wandb/
 *.log
 
+# Local-only test venv (created by tests/make_synthetic_fixtures.py instructions)
+.venv-local/
+
+# Diagnostic plots (saved to repo root by 017/019)
+*.png
+
 # Secrets
 .env
 .env.*

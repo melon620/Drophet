@@ -13,6 +13,7 @@ rdkit>=2022.09.1
 scikit-learn>=1.3,<2.0
 xgboost>=2.0,<3.0
 shap>=0.44,<1.0
+optuna>=3.5,<5.0
 
 # --- Deep learning (GNN) ---
 # NOTE: torch-geometric requires a torch install matching the wheel
