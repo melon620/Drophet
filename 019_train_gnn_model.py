@@ -232,7 +232,12 @@ class DDIInferenceTool:
 
         with torch.no_grad():
             output = self.model(bg1, bg2, d1, d2)
-            arr = np.clip(output.cpu().numpy().flatten() * 100.0, 0.0, 100.0)
+            # Surface the magnitude per category, capped at 100. The per-head
+            # Linear is unconstrained, so untrained / undertrained models
+            # routinely emit small negative values; flooring those at zero
+            # collapses many real test pairs to "0% Low Risk" and hides
+            # relative signal. Calibrating sign is left for PR-C.
+            arr = np.minimum(np.abs(output.cpu().numpy().flatten()) * 100.0, 100.0)
 
         # Top-line incidence is the worst per-category prediction. Same coarse
         # semantics as the prior single-head max-aggregated model so existing
