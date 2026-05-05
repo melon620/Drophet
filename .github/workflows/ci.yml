@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint-and-light-tests:
+    name: Syntax + lightweight unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install lightweight deps
+        # Heavy DL deps (torch, torch-geometric, rdkit) are NOT installed here.
+        # The test files use pytest.importorskip so they no-op when those are
+        # missing. This keeps CI fast and avoids the multi-GB torch download
+        # for syntax / pure-Python correctness.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy pandas scikit-learn
+
+      - name: Compile-check all numbered scripts
+        run: |
+          python -m py_compile drophet_utils.py
+          for f in $(ls 0*.py 2>/dev/null); do
+            python -m py_compile "$f" || exit 1
+          done
+
+      - name: Run pytest (unit tests that don't need torch/rdkit)
+        run: pytest tests/test_drophet_utils.py -v
