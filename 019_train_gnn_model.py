@@ -23,12 +23,29 @@ from torch_geometric.nn import GINConv, global_add_pool, global_mean_pool, Layer
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    mean_absolute_error,
+    roc_auc_score,
+)
 import os
 import copy
 import requests
 import urllib.parse
 import warnings
+
+# Per-category binary threshold for class-imbalance weighting and PR-AUC /
+# Brier metrics. ≥5% incidence is treated as a "positive" event in line
+# with the Low/Moderate tier cutoff used in 017.
+RISK_THRESHOLD_PCT = 5.0
+
+try:
+    import matplotlib.pyplot as plt
+    plt.switch_backend('Agg')
+    HAS_PLOT = True
+except ImportError:
+    HAS_PLOT = False
 
 from drophet_utils import seed_everything, pair_keys
 
@@ -312,6 +329,22 @@ def train_pipeline():
                               collate_fn=pair_collate, generator=g)
     test_loader = DataLoader(DDIPairDataset(test_df, target_cols), batch_size=8, collate_fn=pair_collate)
 
+    # Per-category positive-class weights from the TRAIN split only. For each
+    # AE category we compute n_neg/n_pos at the RISK_THRESHOLD_PCT cutoff and
+    # use that as the per-positive sample weight in a weighted L1 loss. This
+    # prevents the model from collapsing to "always predict ~0%" on highly
+    # imbalanced categories. Computed on train to avoid leakage.
+    train_targets = train_df[target_cols].values / 100.0
+    is_pos_train = train_targets >= (RISK_THRESHOLD_PCT / 100.0)
+    pos_weights = []
+    for j in range(n_outputs):
+        n_pos = int(is_pos_train[:, j].sum())
+        n_neg = int((~is_pos_train[:, j]).sum())
+        pos_weights.append((n_neg / n_pos) if n_pos > 0 and n_neg > 0 else 1.0)
+    pos_weights_t = torch.tensor(pos_weights, dtype=torch.float)
+    print(f"   Positive-class weights @ ≥{RISK_THRESHOLD_PCT}%: " +
+          ", ".join(f"{c}={w:.2f}" for c, w in zip(target_cols, pos_weights)))
+
     model = GNNModel(n_outputs=n_outputs).to('cpu')
     pretrain_file = 'gnn_pretrained_backbone.pth'
     if os.path.exists(pretrain_file):
@@ -321,13 +354,18 @@ def train_pipeline():
 
     # Adding a tiny weight_decay (1e-4) to prevent overfitting on the small dataset
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-    # L1 (MAE) for both the training objective and the selection metric, so the
-    # loss the optimiser minimises matches the metric we use to pick the best
-    # epoch. Previously: trained on MSE, selected on MAE — those don't agree,
-    # which means the epoch checkpoint we kept wasn't optimal for either.
-    criterion = torch.nn.L1Loss()
+
+    # Weighted L1 (MAE): per-row per-category, positives upweighted by the
+    # per-category n_neg/n_pos. Also keeps train objective ≡ selection metric
+    # (both are MAE-flavored), so the kept checkpoint really is optimal.
+    threshold_scaled = RISK_THRESHOLD_PCT / 100.0
+    def weighted_l1(pred, target):
+        is_pos = (target >= threshold_scaled).float()
+        weights = is_pos * pos_weights_t.unsqueeze(0) + (1.0 - is_pos)
+        return (weights * (pred - target).abs()).mean()
 
     best_mae, best_state = float('inf'), None
+    last_val_preds, last_val_actuals = None, None  # for calibration plot
 
     for epoch in range(1, 201):
         model.train()
@@ -335,31 +373,43 @@ def train_pipeline():
         for g1, g2, d1, d2, target in train_loader:
             optimizer.zero_grad()
             out = model(g1, g2, d1, d2)
-            loss = criterion(out, target)
+            loss = weighted_l1(out, target)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
 
         model.eval()
-        total_mae = 0.0
-        n_batches = 0
+        epoch_preds, epoch_actuals = [], []
         with torch.no_grad():
             for g1, g2, d1, d2, target in test_loader:
                 out = model(g1, g2, d1, d2)
-                p = np.maximum(out.numpy(), 0.0) * 100.0
+                p = np.abs(out.numpy()) * 100.0   # magnitude convention (see PR-B)
+                p = np.minimum(p, 100.0)
                 a = target.numpy() * 100.0
-                total_mae += float(np.abs(p - a).mean())
-                n_batches += 1
+                epoch_preds.append(p); epoch_actuals.append(a)
 
-        avg_mae = total_mae / max(n_batches, 1)
+        all_p = np.vstack(epoch_preds) if epoch_preds else np.zeros((0, n_outputs))
+        all_a = np.vstack(epoch_actuals) if epoch_actuals else np.zeros((0, n_outputs))
+        avg_mae = float(np.abs(all_p - all_a).mean()) if all_p.size else float('inf')
 
         if avg_mae < best_mae:
             best_mae = avg_mae
             best_state = copy.deepcopy(model.state_dict())
+            last_val_preds, last_val_actuals = all_p, all_a
 
         if epoch % 20 == 0 or epoch == 1:
             train_avg = train_loss / max(len(train_loader), 1)
-            print(f"   Epoch {epoch:03d} | Train L1: {train_avg:.4f} | Val MAE: {avg_mae:.4f}% (Best: {best_mae:.4f}%)")
+            # Per-category PR-AUC at threshold, averaged across categories
+            # that have both classes present in the val split.
+            pr_aucs = []
+            for j in range(n_outputs):
+                a_bin = (all_a[:, j] >= RISK_THRESHOLD_PCT).astype(int)
+                if a_bin.sum() and a_bin.sum() < len(a_bin):
+                    pr_aucs.append(average_precision_score(a_bin, all_p[:, j] / 100.0))
+            mean_pr = float(np.mean(pr_aucs)) if pr_aucs else float('nan')
+            print(f"   Epoch {epoch:03d} | Train wL1: {train_avg:.4f} | "
+                  f"Val MAE: {avg_mae:.4f}% | Mean PR-AUC: {mean_pr:.3f} "
+                  f"(Best MAE: {best_mae:.4f}%)")
 
     # Save state + metadata so DDIInferenceTool knows what each output column
     # means and how many outputs the head produced. The legacy raw-state-dict
@@ -368,8 +418,59 @@ def train_pipeline():
         'model_state': best_state,
         'target_cols': target_cols,
         'n_outputs': n_outputs,
+        'pos_weights': pos_weights,
+        'risk_threshold_pct': RISK_THRESHOLD_PCT,
     }, 'ddi_gnn_best_model.pth')
     print("✅ Training complete. Artifacts saved successfully.")
+
+    # Per-category metrics on the best epoch's predictions
+    if last_val_preds is not None and last_val_preds.size:
+        print("\n📐 PER-CATEGORY VAL METRICS @ ≥{}% incidence".format(RISK_THRESHOLD_PCT))
+        rows = []
+        for j, cat in enumerate(target_cols):
+            a = last_val_actuals[:, j]
+            p = last_val_preds[:, j]
+            mae_j = float(np.abs(a - p).mean())
+            a_bin = (a >= RISK_THRESHOLD_PCT).astype(int)
+            p_prob = np.clip(p / 100.0, 0.0, 1.0)
+            row = {"category": cat, "mae_pct": mae_j, "n_pos": int(a_bin.sum())}
+            if a_bin.sum() and a_bin.sum() < len(a_bin):
+                row["pr_auc"] = float(average_precision_score(a_bin, p_prob))
+                row["roc_auc"] = float(roc_auc_score(a_bin, p_prob))
+                row["brier"] = float(brier_score_loss(a_bin, p_prob))
+            rows.append(row)
+        for row in rows:
+            extras = ""
+            if "pr_auc" in row:
+                extras = f" | PR-AUC {row['pr_auc']:.3f} | ROC-AUC {row['roc_auc']:.3f} | Brier {row['brier']:.3f}"
+            print(f"   - {row['category']}: MAE {row['mae_pct']:.2f}% "
+                  f"(n_pos={row['n_pos']}/{len(last_val_actuals)}){extras}")
+
+        # Calibration plot: pool predictions across all categories at the same
+        # threshold. One PNG, simple to read; per-category curves are saved
+        # only if there's enough positive mass to make them meaningful.
+        if HAS_PLOT:
+            y_bin = (last_val_actuals.flatten() >= RISK_THRESHOLD_PCT).astype(int)
+            y_prob = np.clip(last_val_preds.flatten() / 100.0, 0.0, 1.0)
+            if y_bin.sum() and y_bin.sum() < len(y_bin):
+                n_bins = 5
+                edges = np.linspace(0.0, 1.0, n_bins + 1)
+                bidx = np.clip(np.digitize(y_prob, edges) - 1, 0, n_bins - 1)
+                bp = np.array([y_prob[bidx == b].mean() if (bidx == b).any() else np.nan
+                               for b in range(n_bins)])
+                bo = np.array([y_bin[bidx == b].mean() if (bidx == b).any() else np.nan
+                               for b in range(n_bins)])
+                fig, ax = plt.subplots(figsize=(5, 5))
+                ax.plot([0, 1], [0, 1], "k--", alpha=0.4, label="Perfect calibration")
+                ax.plot(bp, bo, "o-", label="GNN (pooled across categories)")
+                ax.set_xlabel(f"Predicted P(incidence ≥ {RISK_THRESHOLD_PCT:.0f}%)")
+                ax.set_ylabel("Observed frequency")
+                ax.set_title("GNN reliability diagram (best-epoch val)")
+                ax.legend(loc="best")
+                fig.tight_layout()
+                fig.savefig("gnn_calibration.png", dpi=120)
+                plt.close(fig)
+                print("📈 Reliability diagram → gnn_calibration.png")
 
 if __name__ == "__main__":
     needs_training = FORCE_RETRAIN or not os.path.exists('ddi_gnn_best_model.pth')
