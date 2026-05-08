@@ -29,6 +29,9 @@ import copy
 import requests
 import urllib.parse
 import warnings
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 
 from drophet_utils import seed_everything, pair_keys
 
@@ -39,6 +42,7 @@ seed_everything(SEED)
 
 # --- 0. Control Flags ---
 FORCE_RETRAIN = True
+LIVE_PLOT = True  # real-time training dashboard
 
 # --- 1. Graph & Descriptor Engine ---
 
@@ -213,7 +217,142 @@ class DDIInferenceTool:
         tier = "🟢 Low Risk" if inc < 5 else "🟡 Moderate Risk" if inc < 20 else "🔴 High Risk"
         return {"incidence": f"{inc:.2f}%", "tier": tier, "s1": s1, "s2": s2}
 
-# --- 4. Training Pipeline ---
+# --- 4. Live Visualisation Helpers ---
+
+_DARK, _PANEL, _TEXT, _MUTED = '#0d1117', '#161b22', '#c9d1d9', '#8b949e'
+_BLUE, _RED, _GREEN, _BORDER  = '#58a6ff', '#ff7b72', '#3fb950', '#30363d'
+
+# Known pharmacological anchors tracked live during training
+_REF_PAIRS = [
+    ("CC(=O)CC(C1=CC=CC=C1)C2=C(C3=CC=CC=C3OC2=O)O",
+     "CC(=O)OC1=CC=CC=C1C(=O)O",
+     "Warfarin", "Aspirin", 38.45),
+    ("CCC(C)(C)C(=O)OC1CC(C=C2C1C(C(C=C2)C)CCC3CC(CC(=O)O3)O)C",
+     "CC(=O)N1CCN(CC1)C2=CC=C(C=C2)OCC3COC(O3)(CN4C=CN=C4)C5=C(C=C(C=C5)Cl)Cl",
+     "Simvastatin", "Ketoconazole", 32.40),
+]
+
+def _infer_ref(model):
+    model.eval()
+    out = []
+    with torch.no_grad():
+        for s1, s2, n1, n2, actual in _REF_PAIRS:
+            g1, g2 = smiles_to_graph(s1), smiles_to_graph(s2)
+            d1 = torch.tensor([get_descriptors(s1)], dtype=torch.float)
+            d2 = torch.tensor([get_descriptors(s2)], dtype=torch.float)
+            raw = model(Batch.from_data_list([g1]), Batch.from_data_list([g2]), d1, d2)
+            out.append((n1, n2, actual, max(0.0, raw.item() * 100.0)))
+    return out
+
+def _setup_dashboard():
+    plt.ion()
+    fig = plt.figure(figsize=(16, 9), facecolor=_DARK)
+    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.48, wspace=0.38)
+    axs = {k: fig.add_subplot(gs[r, c]) for k, (r, c) in {
+        'loss': (0,0), 'mae': (0,1), 'scat': (0,2),
+        'm1':   (1,0), 'm2': (1,1), 'info': (1,2)}.items()}
+
+    for ax in axs.values():
+        ax.set_facecolor(_PANEL)
+        ax.tick_params(colors=_MUTED, labelsize=8)
+        for sp in ax.spines.values(): sp.set_color(_BORDER)
+
+    # Loss curve
+    axs['loss'].set_title('Train MSE Loss', color=_TEXT, fontsize=9, fontweight='bold')
+    axs['loss'].set_xlabel('Epoch', color=_MUTED, fontsize=8)
+    line_loss, = axs['loss'].plot([], [], color=_BLUE, lw=1.5)
+
+    # MAE curve
+    axs['mae'].set_title('Validation MAE (%)', color=_TEXT, fontsize=9, fontweight='bold')
+    axs['mae'].set_xlabel('Epoch', color=_MUTED, fontsize=8)
+    line_mae,  = axs['mae'].plot([], [], color=_RED,   lw=1.5, label='Val MAE')
+    line_best, = axs['mae'].plot([], [], color=_GREEN, lw=1.2, ls='--', label='Best')
+    axs['mae'].legend(fontsize=7, labelcolor=_TEXT, facecolor=_PANEL, edgecolor=_BORDER)
+
+    # Scatter plot
+    axs['scat'].set_title('Test: Actual vs Predicted', color=_TEXT, fontsize=9, fontweight='bold')
+    axs['scat'].set_xlabel('Actual Risk (%)', color=_MUTED, fontsize=8)
+    axs['scat'].set_ylabel('Predicted Risk (%)', color=_MUTED, fontsize=8)
+    scat_pts = axs['scat'].scatter([], [], c=_BLUE, alpha=0.55, s=22, zorder=3)
+    diag,    = axs['scat'].plot([], [], '--', color=_RED, alpha=0.35, lw=1)
+
+    # Molecular structure panels (drawn once, static)
+    try:
+        from rdkit.Chem import Draw
+        for ax_key, (s1, s2, n1, n2, actual) in zip(('m1', 'm2'), _REF_PAIRS):
+            mol1, mol2 = Chem.MolFromSmiles(s1), Chem.MolFromSmiles(s2)
+            if mol1 and mol2:
+                img = Draw.MolsToGridImage([mol1, mol2], molsPerRow=2,
+                                           subImgSize=(220, 140), returnPNG=False)
+                axs[ax_key].imshow(img)
+            axs[ax_key].axis('off')
+            axs[ax_key].set_title(f'{n1}  +  {n2}\nActual: {actual:.1f}%  |  Pred: —',
+                                  color=_TEXT, fontsize=8, fontweight='bold')
+    except Exception:
+        for k in ('m1', 'm2'):
+            axs[k].axis('off')
+            axs[k].text(0.5, 0.5, 'RDKit draw unavailable',
+                        transform=axs[k].transAxes, color=_MUTED,
+                        ha='center', va='center', fontsize=8)
+
+    # Info / metrics panel
+    axs['info'].axis('off')
+    info_txt = axs['info'].text(0.06, 0.96, 'Initialising…',
+                                transform=axs['info'].transAxes,
+                                color=_TEXT, fontsize=9, va='top',
+                                fontfamily='monospace')
+
+    fig.suptitle('Project Drophet — Live GNN Training', color=_TEXT,
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.pause(0.05)
+
+    artists = dict(line_loss=line_loss, line_mae=line_mae, line_best=line_best,
+                   scat_pts=scat_pts, diag=diag, info_txt=info_txt)
+    return fig, axs, artists
+
+def _update_dashboard(fig, axs, artists, epoch,
+                      epochs_h, loss_h, mae_h, best_h,
+                      all_a, all_p, ref_preds):
+    ll, lm, lb  = artists['line_loss'], artists['line_mae'], artists['line_best']
+    sp, dg, itx = artists['scat_pts'],  artists['diag'],     artists['info_txt']
+
+    ll.set_data(epochs_h, loss_h)
+    axs['loss'].relim(); axs['loss'].autoscale_view()
+
+    lm.set_data(epochs_h, mae_h)
+    lb.set_data(epochs_h, best_h)
+    axs['mae'].relim(); axs['mae'].autoscale_view()
+
+    if all_a:
+        sp.set_offsets(np.column_stack([all_a, all_p]))
+        lim = max(max(all_a), max(all_p), 1.0) * 1.08
+        dg.set_data([0, lim], [0, lim])
+        axs['scat'].set_xlim(0, lim); axs['scat'].set_ylim(0, lim)
+
+    for ax_key, (n1, n2, actual, pred) in zip(('m1', 'm2'), ref_preds):
+        col = _RED if pred > 20 else (_BLUE if pred > 5 else _GREEN)
+        axs[ax_key].set_title(f'{n1}  +  {n2}\nActual: {actual:.1f}%  |  Pred: {pred:.1f}%',
+                              color=col, fontsize=8, fontweight='bold')
+
+    info_lines = [
+        f"  Epoch    {epoch:>3d} / 200",
+        f"  Val MAE  {mae_h[-1]:.3f}%",
+        f"  Best MAE {best_h[-1]:.3f}%",
+        f"  MSE Loss {loss_h[-1]:.5f}",
+        "",
+        "  Reference predictions:",
+    ]
+    for n1, n2, actual, pred in ref_preds:
+        tier = "HIGH" if pred > 20 else ("MOD" if pred > 5 else "low")
+        info_lines.append(f"  {n1[:9]}+{n2[:9]}: {pred:5.1f}% [{tier}]")
+    itx.set_text('\n'.join(info_lines))
+
+    fig.canvas.draw_idle()
+    plt.pause(0.001)
+
+
+# --- 5. Training Pipeline ---
 
 def pair_collate(batch):
     g1, g2, d1, d2, t = zip(*batch)
@@ -257,6 +396,15 @@ def train_pipeline():
                               collate_fn=pair_collate, generator=g)
     test_loader = DataLoader(DDIPairDataset(test_df), batch_size=8, collate_fn=pair_collate)
 
+    # --- Live dashboard setup ---
+    epochs_h, loss_h, mae_h, best_h = [], [], [], []
+    _fig, _axs, _artists = (None, None, None)
+    if LIVE_PLOT:
+        try:
+            _fig, _axs, _artists = _setup_dashboard()
+        except Exception as e:
+            print(f"⚠️  Live plot unavailable ({e}); continuing without visualisation.")
+
     model = GNNModel().to('cpu')
     pretrain_file = 'gnn_pretrained_backbone.pth'
     if os.path.exists(pretrain_file):
@@ -272,21 +420,29 @@ def train_pipeline():
 
     for epoch in range(1, 201):
         model.train()
+        train_loss_sum, train_batches = 0.0, 0
         for g1, g2, d1, d2, target in train_loader:
             optimizer.zero_grad()
             out = model(g1, g2, d1, d2)
             loss = criterion(out, target)
             loss.backward()
             optimizer.step()
+            train_loss_sum += loss.item()
+            train_batches  += 1
+        train_loss_avg = train_loss_sum / max(train_batches, 1)
 
         model.eval()
         total_mae = 0
+        all_a, all_p = [], []
         with torch.no_grad():
             for g1, g2, d1, d2, target in test_loader:
                 out = model(g1, g2, d1, d2)
                 p = np.maximum(out.numpy().flatten(), 0.0) * 100.0
                 a = target.numpy().flatten() * 100.0
                 total_mae += mean_absolute_error(a, p)
+                if LIVE_PLOT and _fig is not None:
+                    all_a.extend(a.tolist())
+                    all_p.extend(p.tolist())
 
         avg_mae = total_mae / len(test_loader)
 
@@ -297,8 +453,28 @@ def train_pipeline():
         if epoch % 20 == 0 or epoch == 1:
             print(f"   Epoch {epoch:03d} | Val MAE: {avg_mae:.4f}% (Best: {best_mae:.4f}%)")
 
+        if LIVE_PLOT and _fig is not None:
+            epochs_h.append(epoch)
+            loss_h.append(train_loss_avg)
+            mae_h.append(avg_mae)
+            best_h.append(best_mae)
+            try:
+                _update_dashboard(_fig, _axs, _artists, epoch,
+                                  epochs_h, loss_h, mae_h, best_h,
+                                  all_a, all_p, _infer_ref(model))
+            except Exception:
+                pass
+
     torch.save(best_state, 'ddi_gnn_best_model.pth')
     print("✅ Training complete. Artifacts saved successfully.")
+
+    if LIVE_PLOT and _fig is not None:
+        plt.ioff()
+        _fig.suptitle('Project Drophet — Training Complete', color=_TEXT,
+                      fontsize=13, fontweight='bold')
+        plt.tight_layout()
+        plt.show(block=False)
+        print("📊 Dashboard open — close the window or press Ctrl+C to continue.")
 
 if __name__ == "__main__":
     needs_training = FORCE_RETRAIN or not os.path.exists('ddi_gnn_best_model.pth')
