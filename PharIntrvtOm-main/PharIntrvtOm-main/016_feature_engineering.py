@@ -48,6 +48,17 @@ def main():
     df = pd.read_csv(input_file)
     print(f"Loaded {len(df)} cleaned drug pairs.")
 
+    # Normalize column names so Phase-0 synthetic data (SMILES_1, Target_*)
+    # and Phase-1 clinical data (Canonical_SMILES_1, Target_AE_*) both work.
+    if "Canonical_SMILES_1" not in df.columns and "SMILES_1" in df.columns:
+        df = df.rename(columns={"SMILES_1": "Canonical_SMILES_1", "SMILES_2": "Canonical_SMILES_2"})
+    for col in list(df.columns):
+        if col.startswith("Target_") and not col.startswith("Target_AE_"):
+            df = df.rename(columns={col: col.replace("Target_", "Target_AE_", 1)})
+    for stub in ("NCTId", "GroupId"):
+        if stub not in df.columns:
+            df[stub] = ""
+
     n_bits = 1024 # Standard bit size for balance between depth and performance
     
     feature_cols_1 = [f"D1_Bit_{i}" for i in range(n_bits)] + ["D1_MW", "D1_LogP", "D1_TPSA", "D1_HDonors", "D1_HAcceptors"]
