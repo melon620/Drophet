@@ -29,7 +29,6 @@ import torch
 import torch.nn.functional as F
 from rdkit import Chem
 from rdkit.Chem import Descriptors
-from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import GroupShuffleSplit
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
@@ -50,6 +49,12 @@ DESC_DIM     = 5                                 # RDKit descriptors per drug
 NODE_DIM     = BACKBONE_DIM + DESC_DIM           # 69
 EDGE_DIM     = BACKBONE_DIM * 2 + DESC_DIM * 2  # 138
 MODEL_PATH   = 'nside_ddi_model.pth'
+
+TARGET_COLS = [
+    'Target_Hematologic', 'Target_Cardiovascular', 'Target_Hepatobiliary',
+    'Target_Nervous_System', 'Target_Respiratory', 'Target_Musculoskeletal',
+    'Target_Renal', 'Target_Gastrointestinal', 'Target_Dermatologic',
+]
 
 # --- 1. Molecular Feature Engine (mirrors 019) ---
 
@@ -232,8 +237,9 @@ class DDINSideDataset(torch.utils.data.Dataset):
                 for s in smiles_list])
 
             self.graphs.append(build_interaction_graph(embeddings, descriptors))
-            self.targets.append(
-                float(max(row[c] for c in target_cols if pd.notna(row[c]))) / 100.0)
+            self.targets.append(torch.tensor(
+                [float(row[c]) / 100.0 if pd.notna(row[c]) else 0.0
+                 for c in target_cols], dtype=torch.float32))
             self.combos.append(drugs_list)
 
         print(f"   Dataset ready: {len(self.graphs)} samples")
@@ -255,7 +261,7 @@ class NSideDDIModel(torch.nn.Module):
     edge_attr shapes consistent across all edges in the batch.
     """
     def __init__(self, node_dim=NODE_DIM, edge_dim=EDGE_DIM, hidden=64,
-                 heads1=4, heads2=2):
+                 heads1=4, heads2=2, n_targets=9):
         super().__init__()
         self.node_proj = torch.nn.Linear(node_dim, 128)
 
@@ -272,7 +278,7 @@ class NSideDDIModel(torch.nn.Module):
         self.head = torch.nn.Sequential(
             torch.nn.Linear(hidden * heads2, hidden),
             torch.nn.ReLU(),
-            torch.nn.Linear(hidden, 1),
+            torch.nn.Linear(hidden, n_targets),
         )
 
     def forward(self, data):
@@ -283,7 +289,7 @@ class NSideDDIModel(torch.nn.Module):
         x = F.relu(self.norm2(self.gat2(x, ei, edge_attr=ea)))
 
         graph_emb = global_add_pool(x, data.batch) + global_mean_pool(x, data.batch)
-        return self.head(graph_emb).squeeze(-1)
+        return self.head(graph_emb)  # (batch, n_targets)
 
     def forward_with_attention(self, data):
         """Same as forward() but also returns per-edge attention averaged across heads and layers."""
@@ -298,7 +304,7 @@ class NSideDDIModel(torch.nn.Module):
         x2 = F.relu(self.norm2(x2))
 
         graph_emb = global_add_pool(x2, data.batch) + global_mean_pool(x2, data.batch)
-        output    = self.head(graph_emb).squeeze(-1)
+        output    = self.head(graph_emb)  # (batch, n_targets)
 
         # Average across heads, then average the two layers → (num_edges,)
         combined_alpha = (alpha1.mean(dim=1) + alpha2.mean(dim=1)) / 2.0
@@ -314,18 +320,24 @@ def nside_collate(batch):
 def train_pipeline():
     print("\n--- Phase 6: N-Side DDI Model Training ---")
 
-    input_file = 'training_matrix_nside.csv'
-    if not os.path.exists(input_file):
-        input_file = 'training_matrix_refined_for_gnn.csv'
-    if not os.path.exists(input_file):
-        print(f"Error: dataset not found. Run script 023 first.")
+    for candidate in ('training_matrix_real.csv',
+                      'training_matrix_nside.csv',
+                      'training_matrix_refined_for_gnn.csv'):
+        if os.path.exists(candidate):
+            input_file = candidate
+            break
+    else:
+        print("Error: no training dataset found. Run script 024 first.")
         return
 
     df = pd.read_csv(input_file)
     print(f"   Loaded {len(df)} samples from {input_file}")
 
-    backbone  = load_frozen_backbone()
-    drug_cols = sorted(c for c in df.columns if c.startswith('Drug_'))
+    backbone    = load_frozen_backbone()
+    drug_cols   = sorted(c for c in df.columns if c.startswith('Drug_'))
+    target_cols = [c for c in df.columns if c.startswith('Target_')]
+    n_targets   = len(target_cols)
+    print(f"   Target columns ({n_targets}): {', '.join(target_cols)}")
     groups    = [combo_key(row[drug_cols].tolist()) for _, row in df.iterrows()]
 
     splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
@@ -350,7 +362,7 @@ def train_pipeline():
                               collate_fn=nside_collate, generator=g)
     val_loader   = DataLoader(val_ds,   batch_size=8, collate_fn=nside_collate)
 
-    model     = NSideDDIModel()
+    model     = NSideDDIModel(n_targets=n_targets)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = torch.nn.MSELoss()
 
@@ -372,10 +384,12 @@ def train_pipeline():
         with torch.no_grad():
             for batch_data, targets in val_loader:
                 out = model(batch_data)
-                preds_all.extend(np.maximum(out.numpy().flatten(), 0.0) * 100.0)
-                acts_all.extend(targets.numpy().flatten() * 100.0)
+                preds_all.append(out.numpy() * 100.0)    # (batch, n_targets)
+                acts_all.append(targets.numpy() * 100.0) # (batch, n_targets)
 
-        avg_mae = mean_absolute_error(acts_all, preds_all)
+        preds_np = np.concatenate(preds_all, axis=0)
+        acts_np  = np.concatenate(acts_all,  axis=0)
+        avg_mae  = float(np.abs(preds_np - acts_np).mean())
 
         if avg_mae < best_mae:
             best_mae   = avg_mae
@@ -385,9 +399,16 @@ def train_pipeline():
             avg_loss = train_loss / max(len(train_loader), 1)
             print(f"   Epoch {epoch:03d} | Loss: {avg_loss:.4f} | "
                   f"Val MAE: {avg_mae:.4f}% (Best: {best_mae:.4f}%)")
+        if epoch % 40 == 0:
+            per_cat = np.abs(preds_np - acts_np).mean(axis=0)
+            short = [c.replace('Target_', '') for c in target_cols]
+            cat_str = '  '.join(f"{n}:{v:.1f}" for n, v in zip(short, per_cat))
+            print(f"            Per-cat MAE: {cat_str}")
 
-    torch.save(best_state, MODEL_PATH)
+    torch.save({'state_dict': best_state, 'target_cols': target_cols,
+                'n_targets': n_targets}, MODEL_PATH)
     print(f"\n   Saved best model → {MODEL_PATH}  (Val MAE: {best_mae:.4f}%)")
+    print(f"   Categories: {', '.join(c.replace('Target_', '') for c in target_cols)}")
 
 # --- 7. Inference Tool ---
 
@@ -399,12 +420,21 @@ class NSideInferenceTool:
         self.model    = NSideDDIModel().to(self.device)
         self.is_ready = False
 
+        self.target_cols = TARGET_COLS  # fallback
+
         if os.path.exists(model_path):
-            self.model.load_state_dict(
-                torch.load(model_path, map_location=self.device))
+            ckpt = torch.load(model_path, map_location=self.device)
+            if isinstance(ckpt, dict) and 'state_dict' in ckpt:
+                n_targets = ckpt.get('n_targets', 9)
+                self.target_cols = ckpt.get('target_cols', TARGET_COLS)
+                self.model = NSideDDIModel(n_targets=n_targets).to(self.device)
+                self.model.load_state_dict(ckpt['state_dict'])
+            else:
+                self.model.load_state_dict(ckpt)
             self.model.eval()
             self.is_ready = True
-            print(f"   Model loaded from {model_path}")
+            print(f"   Model loaded from {model_path} "
+                  f"({len(self.target_cols)} targets)")
         else:
             print(f"   Model not found at {model_path}. Run training first.")
 
@@ -454,18 +484,23 @@ class NSideInferenceTool:
         batch = Batch.from_data_list([graph]).to(self.device)
 
         with torch.no_grad():
-            out = self.model(batch)
-            inc = float(max(0.0, min(out.item() * 100.0, 100.0)))
+            out  = self.model(batch).squeeze(0)  # (n_targets,)
+            vals = [float(max(0.0, min(v * 100.0, 100.0))) for v in out.tolist()]
+
+        per_cat = {col.replace('Target_', ''): v
+                   for col, v in zip(self.target_cols, vals)}
+        inc = max(vals)
 
         tier  = 'Low' if inc < 5 else 'Moderate' if inc < 20 else 'High'
         emoji = {'Low': '🟢', 'Moderate': '🟡', 'High': '🔴'}[tier]
 
         return {
-            'incidence': f'{inc:.2f}%',
-            'tier':      f'{emoji} {tier}',
-            'n':         len(valid_names),
-            'drugs':     valid_names,
-            'smiles':    smiles_map,
+            'incidence':    f'{inc:.2f}%',
+            'tier':         f'{emoji} {tier}',
+            'per_category': {k: f'{v:.2f}%' for k, v in per_cat.items()},
+            'n':            len(valid_names),
+            'drugs':        valid_names,
+            'smiles':       smiles_map,
         }
 
     def get_attention(self, drug_names, smiles_map):
@@ -542,13 +577,15 @@ def visualize_prediction(result, tool, attention=None):
     smiles_dict  = result['smiles']
     combined_pct = float(result['incidence'].replace('%', ''))
     n            = result['n']
+    per_cat      = {k: float(v.replace('%', ''))
+                    for k, v in result.get('per_category', {}).items()}
 
     def risk_color(r):
         if r < 5:  return '#27ae60'
         if r < 20: return '#f39c12'
         return '#e74c3c'
 
-    # Compute pairwise risks using the same model (n=2 sub-queries)
+    # Pairwise risks still shown in the network panel (lightweight model calls)
     pair_data = []
     for i, j in combinations(range(n), 2):
         si, sj = smiles_dict.get(drugs[i], ''), smiles_dict.get(drugs[j], '')
@@ -562,7 +599,7 @@ def visualize_prediction(result, tool, attention=None):
             g = build_interaction_graph(embs, descs)
             with torch.no_grad():
                 out = tool.model(Batch.from_data_list([g]).to(tool.device))
-                pair_risk = float(max(0.0, min(out.item() * 100.0, 100.0)))
+                pair_risk = float(max(0.0, min(out.squeeze(0).max().item() * 100.0, 100.0)))
         pair_data.append((drugs[i], drugs[j], i, j, pair_risk))
 
     # ── Figure layout ──────────────────────────────────────────────────────────
@@ -616,35 +653,30 @@ def visualize_prediction(result, tool, attention=None):
     for sp in ax_gauge.spines.values():
         sp.set_edgecolor('#333355')
 
-    # ── Panel 2: Pairwise bar chart ────────────────────────────────────────────
-    if ax_pairs is not None:
-        bar_labels  = [f"{a} + {b}" for a, b, *_ in pair_data]
-        bar_risks   = [pr for *_, pr in pair_data]
-        bar_labels += [f"Combined  (n={n})"]
-        bar_risks  += [combined_pct]
-        bar_colors  = [risk_color(r) for r in bar_risks]
-        bar_colors[-1] = '#8e44ad'  # purple for the combined bar
-
-        y_pos = np.arange(len(bar_labels))
-        ax_pairs.barh(y_pos, bar_risks, color=bar_colors, alpha=0.85,
+    # ── Panel 2: Per-category risk bar chart ──────────────────────────────────
+    if ax_pairs is not None and per_cat:
+        cat_names = list(per_cat.keys())
+        cat_risks = list(per_cat.values())
+        bar_colors = [risk_color(r) for r in cat_risks]
+        y_pos = np.arange(len(cat_names))
+        ax_pairs.barh(y_pos, cat_risks, color=bar_colors, alpha=0.85,
                       height=0.6, zorder=2)
-        for idx, r in enumerate(bar_risks):
+        for idx, r in enumerate(cat_risks):
             ax_pairs.text(r + 0.4, idx, f"{r:.1f}%",
                           va='center', color='white', fontsize=9)
-
         ax_pairs.set_yticks(y_pos)
-        ax_pairs.set_yticklabels(bar_labels, color='#cccccc', fontsize=9)
-        ax_pairs.set_xlim(0, max(bar_risks) * 1.30 + 3)
+        ax_pairs.set_yticklabels(cat_names, color='#cccccc', fontsize=9)
+        ax_pairs.set_xlim(0, max(cat_risks + [1]) * 1.35 + 3)
         ax_pairs.set_xlabel('Risk (%)', color='#888899', fontsize=9)
-        ax_pairs.set_title('Pairwise vs Combined', color='white',
+        ax_pairs.set_title('Risk by Organ System', color='white',
                            fontsize=10, fontweight='bold')
         ax_pairs.set_facecolor('#0d0d1a')
         ax_pairs.invert_yaxis()
         ax_pairs.tick_params(colors='#666688')
         for sp in ax_pairs.spines.values():
             sp.set_edgecolor('#333355')
-        ax_pairs.axvline(combined_pct, color='#8e44ad', lw=1.2,
-                         ls='--', alpha=0.6, zorder=1)
+        ax_pairs.axvline(5,  color='#27ae60', lw=0.8, ls=':', alpha=0.5, zorder=1)
+        ax_pairs.axvline(20, color='#f39c12', lw=0.8, ls=':', alpha=0.5, zorder=1)
 
     # ── Panel 3: Drug network graph ────────────────────────────────────────────
     ax_net.set_facecolor('#0d0d1a')
@@ -773,6 +805,12 @@ if __name__ == '__main__':
             for name, smi in res['smiles'].items():
                 print(f'  {name}: {smi or "(no interaction partner)"}')
             print(f'\n  Combined Risk: {res["incidence"]} | {res["tier"]}')
+            if 'per_category' in res:
+                print('\n  Per-organ-system risks:')
+                for cat, risk_str in res['per_category'].items():
+                    r = float(risk_str.replace('%', ''))
+                    bar = '█' * int(r / 3)
+                    print(f'    {cat:<22} {risk_str:>8}  {bar}')
 
             attention = tool.get_attention(res['drugs'], res['smiles'])
             if attention:
