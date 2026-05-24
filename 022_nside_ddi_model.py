@@ -248,7 +248,7 @@ class DDINSideDataset(torch.utils.data.Dataset):
         return len(self.graphs)
 
     def __getitem__(self, idx):
-        return self.graphs[idx], torch.tensor(self.targets[idx], dtype=torch.float32)
+        return self.graphs[idx], self.targets[idx].clone()
 
 # --- 5. N-Side GAT Model ---
 
