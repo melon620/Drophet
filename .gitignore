@@ -53,6 +53,10 @@ Thumbs.db
 *.onnx
 *.joblib
 
+# OnSIDES database artifacts (rebuild with 025_onsides_integration.py)
+onsides_data/
+onsides-*.zip
+
 # Local logs / experiment runs
 logs/
 runs/
