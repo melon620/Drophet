@@ -1,0 +1,47 @@
+
+--- Phase 6: N-Side DDI Model Training ---
+   Loaded 3486 samples from training_matrix_real.csv
+   Loaded backbone weights from gnn_pretrained_backbone.pth
+   Target columns (9): Target_Hematologic, Target_Cardiovascular, Target_Hepatobiliary, Target_Nervous_System, Target_Respiratory, Target_Musculoskeletal, Target_Renal, Target_Gastrointestinal, Target_Dermatologic
+   Split: 2788 train / 698 val — no overlap confirmed.
+
+Building train dataset...
+   Pre-computing embeddings for 83 unique structures...
+   Dataset ready: 2788 samples
+Building val dataset...
+   Pre-computing embeddings for 83 unique structures...
+   Dataset ready: 698 samples
+   Epoch 001 | Loss: 0.0115 | Val MAE: 7.6073% (Best: 7.6073%)
+   Epoch 020 | Loss: 0.0080 | Val MAE: 6.8473% (Best: 6.5098%)
+   Epoch 040 | Loss: 0.0073 | Val MAE: 6.2026% (Best: 6.1067%)
+            Per-cat MAE: Hematologic:5.6  Cardiovascular:6.3  Hepatobiliary:3.6  Nervous_System:6.9  Respiratory:6.6  Musculoskeletal:6.9  Renal:4.7  Gastrointestinal:7.9  Dermatologic:7.3
+   Epoch 060 | Loss: 0.0069 | Val MAE: 5.9788% (Best: 5.9423%)
+   Epoch 080 | Loss: 0.0069 | Val MAE: 5.8129% (Best: 5.8129%)
+            Per-cat MAE: Hematologic:5.3  Cardiovascular:5.9  Hepatobiliary:3.5  Nervous_System:6.1  Respiratory:6.3  Musculoskeletal:6.6  Renal:4.1  Gastrointestinal:7.8  Dermatologic:6.7
+   Epoch 100 | Loss: 0.0067 | Val MAE: 5.7758% (Best: 5.7482%)
+   Epoch 120 | Loss: 0.0066 | Val MAE: 5.7995% (Best: 5.6973%)
+            Per-cat MAE: Hematologic:5.2  Cardiovascular:5.8  Hepatobiliary:3.5  Nervous_System:5.7  Respiratory:6.5  Musculoskeletal:6.8  Renal:4.0  Gastrointestinal:7.8  Dermatologic:6.8
+   Epoch 140 | Loss: 0.0065 | Val MAE: 5.7230% (Best: 5.6738%)
+   Epoch 160 | Loss: 0.0074 | Val MAE: 6.2461% (Best: 5.6356%)
+            Per-cat MAE: Hematologic:5.8  Cardiovascular:6.7  Hepatobiliary:3.5  Nervous_System:7.0  Respiratory:6.7  Musculoskeletal:7.0  Renal:4.3  Gastrointestinal:8.0  Dermatologic:7.2
+   Epoch 180 | Loss: 0.0073 | Val MAE: 6.1372% (Best: 5.6356%)
+   Epoch 200 | Loss: 0.0078 | Val MAE: 6.5062% (Best: 5.6356%)
+            Per-cat MAE: Hematologic:5.6  Cardiovascular:7.4  Hepatobiliary:3.5  Nervous_System:7.8  Respiratory:6.6  Musculoskeletal:6.9  Renal:4.6  Gastrointestinal:8.3  Dermatologic:7.7
+
+   Saved best model → nside_ddi_model.pth  (Val MAE: 5.6356%)
+   Categories: Hematologic, Cardiovascular, Hepatobiliary, Nervous_System, Respiratory, Musculoskeletal, Renal, Gastrointestinal, Dermatologic
+
+=======================================================
+DROPHET — N-SIDE DDI PREDICTOR
+=======================================================
+Enter drugs one per line. Blank line to analyze.
+Commands: 'retrain', 'exit'
+
+   Loaded backbone weights from gnn_pretrained_backbone.pth
+   Model loaded from nside_ddi_model.pth (9 targets)
+Enter drugs (one per line, blank line when done):
+  Drug 1: Traceback (most recent call last):
+  File "/Users/Elon/Drophet-1/022_nside_ddi_model.py", line 780, in <module>
+    line = input(f'  Drug {len(drug_names) + 1}: ').strip()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+EOFError: EOF when reading a line
