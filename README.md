@@ -75,6 +75,22 @@ runtime via `window.GEMINI_API_KEY` (see comment in the file). For production,
 this should call a backend proxy that holds the key as a server-side secret
 instead of hitting the Gemini API directly from the browser.
 
+### Test interface (`drophet_app.py`)
+
+A Gradio app that wraps the trained GNN inference tool from
+`019_train_gnn_model.py`. It is the simplest way to sanity-check predictions
+end-to-end without the interactive CLI loop.
+
+```bash
+pip install -r requirements.txt
+python3 019_train_gnn_model.py    # one-time: produce ddi_gnn_best_model.pth
+python3 drophet_app.py            # opens http://127.0.0.1:7860
+```
+
+Set `DROPHET_SHARE=1` to also expose a 72-hour public Gradio tunnel (useful
+for quickly sharing with collaborators; do **not** use this for anything
+clinical or with real patient context).
+
 ---
 
 ## Reproducibility
